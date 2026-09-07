@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# devbox guardrail: a `gh` shim that blocks PR merges.
+#
+# Sits ahead of the real gh on PATH (see the Dockerfile) and forwards every
+# command untouched except the ones that would merge a pull request. Lives in
+# /usr/local/share/devbox/bin/, root-owned, so the agent cannot edit it.
+#
+# Like the pre-push hook this is a guardrail, not a sandbox: the token in the
+# container can merge over plain HTTP if something is determined to. It exists
+# so that "just merge it then" is never one autonomous step away.
+#
+# Allow merges permanently by setting DEVBOX_ALLOW_MERGE=1 in compose.yaml, or
+# once with:  DEVBOX_ALLOW_MERGE=1 gh pr merge 12
+set -uo pipefail
+
+self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+
+if [ "${DEVBOX_ALLOW_MERGE:-0}" != "1" ]; then
+  # Deliberately blunt: any token that means "merge" anywhere in the command
+  # line, whether that is `gh pr merge`, a REST call to .../pulls/1/merge, or a
+  # GraphQL mutation. A false positive (say, searching for the word "merge") is
+  # cheap to work around; a missed merge is not.
+  for arg in "$@"; do
+    case "$arg" in
+      merge|*/merge|*mergePullRequest*|*enablePullRequestAutoMerge*)
+        cat >&2 <<MSG
+
+  x devbox: merging is disabled in this container.
+    Blocked argument: '$arg'
+
+    Open the PR and let a human merge it, or override deliberately:
+        DEVBOX_ALLOW_MERGE=1 gh $*
+
+MSG
+        exit 1
+        ;;
+    esac
+  done
+fi
+
+# Find the first real gh on PATH that is not this shim.
+real=""
+IFS=':' read -r -a _dirs <<< "$PATH"
+for d in "${_dirs[@]}"; do
+  [ -n "$d" ] || continue
+  cand="$d/gh"
+  [ -x "$cand" ] || continue
+  [ "$(readlink -f "$cand" 2>/dev/null || echo "$cand")" = "$self" ] && continue
+  real="$cand"
+  break
+done
+
+if [ -z "$real" ]; then
+  echo "devbox: the real gh CLI was not found on PATH." >&2
+  exit 127
+fi
+
+exec "$real" "$@"

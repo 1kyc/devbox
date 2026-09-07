@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# devbox — a thin wrapper over `docker compose` for the box.
+#
+# Exists mostly to stop you running compose from the wrong place: PLAYGROUND is
+# a Linux absolute path, so every command has to run from inside WSL with this
+# repo's compose.yaml. Symlink it onto your PATH:
+#
+#   ln -s ~/devbox/bin/devbox ~/.local/bin/devbox
+#
+#   devbox                shell into the box (same as `devbox shell`)
+#   devbox cc | cx        start Claude Code / Codex directly
+#   devbox up | down      start / stop it
+#   devbox rebuild        rebuild the image and recreate the container
+#   devbox logs           what setup.sh said at boot (start here when it fails)
+#   devbox audit          re-run the guard and host-bleed checks
+#   devbox status         is it up, and how long has it been up
+#
+# Anything else is passed straight through to `docker compose`.
+set -euo pipefail
+
+REPO="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+cd "$REPO"
+
+if [ ! -f .env ]; then
+  echo "devbox: no .env here. Start with:" >&2
+  echo "    cp $REPO/.env.example $REPO/.env   # then edit PLAYGROUND" >&2
+  exit 1
+fi
+
+dc() { docker compose "$@"; }
+
+# The box is only useful when it is up; shelling into a stopped box should start
+# it rather than erroring at you.
+ensure_up() {
+  if [ -z "$(dc ps -q devbox 2>/dev/null)" ] \
+     || [ "$(docker inspect -f '{{.State.Running}}' "$(dc ps -q devbox)" 2>/dev/null)" != true ]; then
+    dc up -d
+  fi
+}
+
+cmd="${1:-shell}"
+[ $# -gt 0 ] && shift
+
+case "$cmd" in
+  shell|sh) ensure_up; exec dc exec devbox bash -l ;;
+  cc)       ensure_up; exec dc exec devbox bash -lc 'claude --dangerously-skip-permissions "$@"' _ "$@" ;;
+  cx)       ensure_up; exec dc exec devbox bash -lc 'codex --dangerously-bypass-approvals-and-sandbox "$@"' _ "$@" ;;
+  run)      ensure_up; exec dc exec devbox bash -lc "$*" ;;
+  audit)    ensure_up; exec dc exec devbox /usr/local/share/devbox/setup.sh --audit ;;
+  up)       exec dc up -d "$@" ;;
+  down)     exec dc down "$@" ;;
+  logs)     exec dc logs "$@" devbox ;;
+  status)   exec dc ps ;;
+  rebuild)  dc build --pull "$@"; exec dc up -d --force-recreate ;;
+  *)        exec dc "$cmd" "$@" ;;
+esac

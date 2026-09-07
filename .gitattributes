@@ -1,0 +1,4 @@
+# Every file here is read by a Linux shell inside a container. A CRLF in a
+# script is a syntax error with a confusing message, so never let a checkout on
+# Windows introduce one.
+* text eol=lf

@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# devbox guardrail: refuse to push to a protected branch.
+#
+# Installed for EVERY repo in the container via core.hooksPath, which is set
+# through GIT_CONFIG_KEY_0 in compose.yaml. Lives at
+# /usr/local/share/devbox/hooks/, root-owned, so the agent cannot edit it.
+#
+# One box now holds many repositories, so this matters more here than it did in
+# the per-repo container: it is the same hook protecting every one of them,
+# including every worktree, without per-repo installation.
+#
+# This stops the accident (an agent tidying up with `git push origin main`), not
+# a determined process: `--no-verify` skips it, and so does clearing
+# GIT_CONFIG_COUNT. The enforced-by-GitHub version of this rule is a branch
+# ruleset on the repo — see the README.
+#
+# Configure with DEVBOX_PROTECTED_BRANCHES (space separated, "" disables).
+set -uo pipefail
+
+protected="${DEVBOX_PROTECTED_BRANCHES-main master}"
+remote_name="${1:-}"
+
+# stdin: "<local ref> <local sha> <remote ref> <remote sha>" per ref being pushed
+input="$(cat)"
+
+if [ -n "$protected" ]; then
+  while read -r _local_ref _local_sha remote_ref _remote_sha; do
+    [ -n "${remote_ref:-}" ] || continue
+    case "$remote_ref" in
+      refs/heads/*) branch="${remote_ref#refs/heads/}" ;;
+      *) continue ;;
+    esac
+    for p in $protected; do
+      [ "$branch" = "$p" ] || continue
+      cat >&2 <<MSG
+
+  x devbox: refusing to push to '$branch' on '$remote_name'.
+    '$branch' is protected (DEVBOX_PROTECTED_BRANCHES="$protected").
+
+    Push a branch and open a PR instead:
+        git switch -c my-change
+        git push -u origin my-change
+        gh pr create --base $branch --fill
+
+MSG
+      exit 1
+    done
+  done <<< "$input"
+fi
+
+# Hand off to the repo's own pre-push hook, if it has one — core.hooksPath would
+# otherwise silently disable it. --git-common-dir rather than --git-dir so this
+# resolves correctly inside a worktree.
+common_dir="$(git rev-parse --git-common-dir 2>/dev/null || echo .git)"
+repo_hook="$common_dir/hooks/pre-push"
+if [ -x "$repo_hook" ] \
+   && [ "$(readlink -f "$repo_hook" 2>/dev/null)" != "$(readlink -f "$0" 2>/dev/null)" ]; then
+  printf '%s\n' "$input" | "$repo_hook" "$@"
+  exit $?
+fi
+
+exit 0

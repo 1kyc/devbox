@@ -1,0 +1,109 @@
+# devbox — one standing container for running coding agents in bypass mode.
+#
+# Run this from inside WSL (or Linux), never from PowerShell: PLAYGROUND is a
+# Linux absolute path, and a Windows Docker client would mangle it.
+#
+#   cp .env.example .env    # then edit PLAYGROUND
+#   docker compose up -d
+#   docker compose exec devbox bash -l
+#
+# The container exits if setup.sh refuses to start it. That is deliberate — see
+# DESIGN.md, "fail closed". `docker compose logs devbox` says why.
+services:
+  devbox:
+    build:
+      context: .
+      args:
+        USERNAME: ${DEVBOX_USER:-kyc}
+        USER_UID: ${DEVBOX_UID:-1000}
+        USER_GID: ${DEVBOX_GID:-1000}
+        CLAUDE_VERSION: ${CLAUDE_VERSION:-stable}
+        CODEX_VERSION: ${CODEX_VERSION:-latest}
+        PYTHON_VERSION: ${PYTHON_VERSION:-3.13}
+        NODE_VERSION: ${NODE_VERSION:-lts-latest}
+    image: devbox:local
+    container_name: ${DEVBOX_NAME:-devbox}
+
+    # The playground is mounted at THE SAME ABSOLUTE PATH inside the container
+    # as on the host. This is not tidiness: a git worktree records absolute
+    # paths in .git and in the main repo's .git/worktrees/<name>/gitdir, so a
+    # worktree created on one side breaks on the other the moment those paths
+    # disagree. Same path in both worlds, and worktrees just work.
+    #
+    # Combined with a container user that shares your host uid, files an agent
+    # writes come out owned by you, with no chown and no safe.directory.
+    volumes:
+      - ${PLAYGROUND}:${PLAYGROUND}
+      # Everything that should survive a rebuild. Note what is NOT here:
+      # ~/.local, where both agents and both runtimes live. A volume mounted
+      # over an image directory hides the image's copy, so putting programs in
+      # one means a rebuild silently keeps serving the old contents.
+      - claude:/home/${DEVBOX_USER:-kyc}/.claude
+      - codex:/home/${DEVBOX_USER:-kyc}/.codex
+      - gh:/home/${DEVBOX_USER:-kyc}/.config/gh
+      - uv-cache:/home/${DEVBOX_USER:-kyc}/.cache/uv
+      - npm-cache:/home/${DEVBOX_USER:-kyc}/.npm
+      - history:/commandhistory
+    working_dir: ${PLAYGROUND}
+
+    environment:
+      DEVBOX_PLAYGROUND: ${PLAYGROUND}
+      CLAUDE_CONFIG_DIR: /home/${DEVBOX_USER:-kyc}/.claude
+      CODEX_HOME: /home/${DEVBOX_USER:-kyc}/.codex
+      HISTFILE: /commandhistory/.bash_history
+
+      # Guardrail configuration.
+      DEVBOX_PROTECTED_BRANCHES: ${DEVBOX_PROTECTED_BRANCHES:-main master}
+      DEVBOX_ALLOW_MERGE: ${DEVBOX_ALLOW_MERGE:-0}
+      DEVBOX_ALLOW_BROAD_TOKEN: ${DEVBOX_ALLOW_BROAD_TOKEN:-0}
+
+      # Git config through the environment, which git reads AFTER every config
+      # file — so none of this can be overridden by a repo's .git/config, by a
+      # helper an editor writes into ~/.gitconfig, or by an agent running
+      # `git config`. `git config --show-origin` reports it as "command line:".
+      #
+      #   0  the pre-push guard, for every repo and every worktree at once.
+      #      Repo-local core.hooksPath (husky) cannot displace it.
+      #   1  an EMPTY credential.helper, which RESETS the accumulated list.
+      #      Without this, a helper bridged in from a host would still be tried.
+      #   2  ...then gh's, as the only one left.
+      GIT_CONFIG_COUNT: "3"
+      GIT_CONFIG_KEY_0: core.hooksPath
+      GIT_CONFIG_VALUE_0: /usr/local/share/devbox/hooks
+      GIT_CONFIG_KEY_1: credential.helper
+      GIT_CONFIG_VALUE_1: ""
+      GIT_CONFIG_KEY_2: credential.helper
+      GIT_CONFIG_VALUE_2: "!gh auth git-credential"
+
+      # Nothing in here should ever reach an ssh-agent.
+      SSH_AUTH_SOCK: ""
+
+    # No root, no capabilities, no way to acquire either. This is what makes
+    # "the container is the sandbox" a real claim rather than a hopeful one:
+    # a compromised agent cannot install packages, load modules, or escalate.
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: ${DEVBOX_PIDS_LIMIT:-4096}
+
+    # Codex's browser login callback. Bound to loopback so it is reachable from
+    # your machine and from nowhere else.
+    ports:
+      - "127.0.0.1:${CODEX_LOGIN_PORT:-1455}:1455"
+
+    init: true                  # reap zombies; `sleep infinity` is not an init
+    restart: unless-stopped     # a standing box should survive a reboot
+    stop_grace_period: 30s      # let a running agent finish writing its session
+
+    # setup.sh must succeed before the box is usable; if it fails the container
+    # exits rather than coming up half-configured. `bash -l` on purpose — it
+    # exercises the login-shell PATH restore at boot, so a broken /etc/profile.d
+    # shows up here instead of the first time an agent shells out.
+    command: ["bash", "-lc", "/usr/local/share/devbox/setup.sh && exec sleep infinity"]
+
+volumes:
+  claude:
+  codex:
+  gh:
+  uv-cache:
+  npm-cache:
+  history:
