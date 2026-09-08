@@ -53,7 +53,17 @@ fi
 #
 # Each fix moved the same bug: re-deriving configuration that compose already
 # resolves. The cheapest correct answer is not to re-derive it.
-ensure_up() { docker compose up -d >/dev/null; }
+# --no-recreate is the load-bearing flag. Plain `up -d` preserves a running
+# container only while its config and image are unchanged; otherwise it stops
+# and REPLACES it. On a box that is meant to run for weeks that means opening a
+# second shell, after editing .env, silently kills every agent session in the
+# first one and discards anything installed in the writable layer (a `claude
+# update`, for instance).
+#
+# Starting the box is a side effect of wanting a shell. Applying configuration
+# is a decision, and it stays with the commands that say so: `devbox up` and
+# `devbox rebuild`.
+ensure_up() { docker compose up -d --no-recreate >/dev/null; }
 
 # `exec docker compose` stays spelled out inside the function, so this cannot
 # regress into the `exec dc` mistake above.

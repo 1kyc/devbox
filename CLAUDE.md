@@ -42,7 +42,7 @@ bash tests/worktree-roundtrip.sh
 bash tests/launcher.sh
 ```
 
-All four must be green (176 assertions). The fail-closed suite uses a fake `gh`,
+All four must be green (178 assertions). The fail-closed suite uses a fake `gh`,
 so it needs no credentials; the others run against the real box.
 
 ## Editing from Windows

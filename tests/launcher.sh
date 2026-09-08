@@ -85,8 +85,12 @@ cleanup_alt
 # DEVBOX_NAME and CODEX_LOGIN_PORT too. The box is a singleton by design — a
 # pinned container_name and a fixed loopback port — so a second copy needs both
 # overridden to coexist with the real one for the length of this test.
-( cd "$REPO" && COMPOSE_PROJECT_NAME="$ALT" DEVBOX_NAME="$ALT" CODEX_LOGIN_PORT=14559 \
-    "$DEVBOX" up ) >/dev/null 2>&1
+alt() { ( cd "$REPO" && COMPOSE_PROJECT_NAME="$ALT" DEVBOX_NAME="$ALT" \
+            CODEX_LOGIN_PORT=14559 "$@" ); }
+
+# `run`, not `up`: this exercises ensure_up, which is the path being tested.
+# `devbox up` bypasses it entirely.
+alt "$DEVBOX" run true >/dev/null 2>&1
 alt_id="$(docker container ls -q -f label=com.docker.compose.project="$ALT" -f status=running)"
 [ -n "$alt_id" ] \
   && ok "an exported COMPOSE_PROJECT_NAME starts THAT project's box" \
@@ -96,6 +100,29 @@ alt_id="$(docker container ls -q -f label=com.docker.compose.project="$ALT" -f s
 [ -n "$(docker container ls -q -f name='^devbox$' -f status=running)" ] \
   && ok "the default box is left running alongside it" \
   || bad "the override disturbed the default box"
+
+echo "== opening a shell never replaces a running box =="
+# Plain `up -d` preserves a container only while config and image are
+# unchanged; otherwise it stops and REPLACES it. On a box meant to run for
+# weeks, that means a second shell after an .env edit kills the agent sessions
+# in the first one and discards anything installed in the writable layer.
+if [ -n "$alt_id" ]; then
+  docker exec "$ALT" bash -c 'echo alive > /tmp/devbox-liveness' >/dev/null 2>&1
+  before="$(docker inspect -f '{{.Id}}' "$ALT" 2>/dev/null)"
+
+  # Change the configuration, then take the ensure_up path.
+  alt env DEVBOX_PIDS_LIMIT=1234 "$DEVBOX" run true >/dev/null 2>&1
+
+  after="$(docker inspect -f '{{.Id}}' "$ALT" 2>/dev/null)"
+  [ -n "$after" ] && [ "$before" = "$after" ] \
+    && ok "the container survives a config change on the ensure_up path" \
+    || bad "the container was REPLACED just by running a command in it"
+  docker exec "$ALT" test -f /tmp/devbox-liveness >/dev/null 2>&1 \
+    && ok "and its writable layer is intact (in-container state survives)" \
+    || bad "the writable layer was discarded — agent sessions would be lost"
+else
+  bad "no alt container to test recreation against (inconclusive)"
+fi
 cleanup_alt
 
 # No hand-rolled config resolution should remain (comments stripped — the file

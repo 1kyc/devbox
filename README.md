@@ -189,7 +189,7 @@ bash tests/worktree-roundtrip.sh
 bash tests/launcher.sh
 ```
 
-176 assertions: the box's invariants, the scope check's refusals (with a fake
+178 assertions: the box's invariants, the scope check's refusals (with a fake
 `gh`), and the worktree round-trip.
 
 ## Troubleshooting
