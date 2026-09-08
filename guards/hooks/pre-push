@@ -18,6 +18,14 @@
 set -uo pipefail
 
 protected="${DEVBOX_PROTECTED_BRANCHES-main master}"
+# Normalise to single spaces before matching. The list is documented as
+# "space separated", but it was previously consumed by `for p in $protected`,
+# which splits on IFS — so a tab or newline between names worked. The glob
+# below matches literal spaces only, and silently stopped protecting `main`
+# when the value was "main<TAB>master". Widening the guard's input is not a
+# thing to discover from a push that should have been refused.
+protected="$(tr -s '[:space:]' ' ' <<<"$protected")"
+protected="${protected# }"; protected="${protected% }"
 remote_name="${1:-}"
 
 # stdin: "<local ref> <local sha> <remote ref> <remote sha>" per ref being pushed

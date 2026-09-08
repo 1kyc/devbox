@@ -203,9 +203,36 @@ check_guards() {
   # every config file — so a repo-local hooksPath (husky, say) cannot displace
   # it. Verified from inside the playground rather than / because the answer is
   # repo-relative.
-  local hooks
-  hooks="$(cd "$PLAYGROUND" 2>/dev/null && git rev-parse --git-path hooks 2>/dev/null || true)"
-  case "${hooks:-/usr/local/share/devbox/hooks}" in
+  # Two observations, because neither alone is enough.
+  #
+  # `git rev-parse --git-path hooks` is the real resolution, but it only answers
+  # inside a repository — and the playground is normally a folder OF repos, not
+  # a repo. It therefore failed in the ordinary case, and a `${hooks:-<guard>}`
+  # fallback turned that failure into "active": with hooks redirected to an
+  # empty directory the summary still printed "push blocked". An observation
+  # that did not happen is UNKNOWN, never "fine".
+  #
+  # So: read the effective core.hooksPath, which is repo-independent because it
+  # comes from the environment, and then confirm it against a real repository if
+  # the playground contains one.
+  local hooks cfg repo
+  cfg="$(git config --get core.hooksPath 2>/dev/null || true)"
+  repo="$(find "$PLAYGROUND" -maxdepth "$SCAN_DEPTH" -name .git -print -prune -quit 2>/dev/null || true)"
+  if [ -n "$repo" ]; then
+    hooks="$(git -C "${repo%/.git}" rev-parse --git-path hooks 2>/dev/null || true)"
+  else
+    hooks="$cfg"          # nothing to resolve against; the config is all we have
+  fi
+
+  case "$hooks" in
+    "")
+      HOOKS_ACTIVE=unknown
+      warn ""
+      warn "  !! devbox: could not determine whether the pre-push guard is active."
+      warn "     core.hooksPath is unset and no repository was found under"
+      warn "     $PLAYGROUND to resolve it against."
+      warn ""
+      ;;
     /usr/local/share/devbox/hooks*) HOOKS_ACTIVE=1 ;;
     *)
       HOOKS_ACTIVE=0
@@ -269,17 +296,20 @@ check_guards() {
 # the same origin as their main checkout, so they dedupe away for free.
 # `-print -prune` stops find descending into .git itself.
 #
-# The dependency directories are pruned by name, not merely bounded by depth.
-# `-maxdepth` still descends INTO node_modules to look for a `.git` at the next
-# level, so a 50-repo playground walked 18k inodes to find 50 — 28 ms of the
-# scan against 1 ms pruned. They cannot contain a repo we care about anyway.
+# NOT pruned by directory name. An earlier version skipped node_modules, .venv,
+# vendor and target to avoid walking dependency trees — and thereby skipped a
+# top-level repository *called* `target`, which vanished from the scan, took the
+# empty-playground exception, and switched off token-scope enforcement
+# altogether. A name says nothing about whether a directory is a checkout.
+#
+# The walk is ~28 ms on a 50-repo playground; the fork reductions below were
+# most of that optimisation anyway (~143 ms of the 171 ms). Correctness of the
+# scan is the boundary this box rests on, so it does not get traded for 27 ms.
 #
 # `git remote get-url` stays a fork per repo (~0.8 ms): reading .git/config
 # directly would be faster and would break worktrees, where .git is a file.
 present_repos() {
-  find "$PLAYGROUND" -maxdepth "$SCAN_DEPTH" \
-       \( -name node_modules -o -name .venv -o -name vendor -o -name target \) -prune -o \
-       -name .git -print -prune 2>/dev/null \
+  find "$PLAYGROUND" -maxdepth "$SCAN_DEPTH" -name .git -print -prune 2>/dev/null \
   | while IFS= read -r g; do
       # ${g%/.git} rather than $(dirname): a builtin, not a fork per repo.
       git -C "${g%/.git}" remote get-url origin 2>/dev/null || true
@@ -456,6 +486,19 @@ verify_token() {
   fi
 
   GH_READY=1
+
+  # A store we could not fully read is a stop in its own right, not merely one
+  # more entry in the count.
+  #
+  # It was previously only a labelled source, so a legacy file holding TWO hosts
+  # collapsed to a single `?unparsed` line: count 1, no multi-credential stop,
+  # and if the selected token happened to verify cleanly the box started — with
+  # a classic enterprise token sitting in the same file, retrievable by naming
+  # its host. "How many credentials are in here" is unanswerable for a file we
+  # cannot parse, and an unanswerable question is the unverifiable branch.
+  if grep -q '/?unparsed' <<<"$CRED_SOURCES"; then
+    broad "a credential store could not be fully read, so the credentials in it cannot be counted or checked"
+  fi
   if [ "$CRED_COUNT" -gt 1 ] 2>/dev/null; then
     broad "$CRED_COUNT GitHub credentials are reachable in this container, and only the selected one can be checked"
   fi
@@ -839,7 +882,11 @@ if [ "$MODE" = full ]; then
   protected="${DEVBOX_PROTECTED_BRANCHES-main master}"
   protected_note="(push blocked)"
   [ -z "$protected" ] && { protected="<none>"; protected_note="(guard disabled)"; }
-  [ "${HOOKS_ACTIVE:-1}" = 1 ] || protected_note="(GUARD NOT ACTIVE — not blocked)"
+  case "${HOOKS_ACTIVE:-unknown}" in
+    1) ;;
+    0)       protected_note="(GUARD NOT ACTIVE — not blocked)" ;;
+    *)       protected_note="(guard state UNVERIFIED)" ;;
+  esac
 
   merges="blocked"
   [ "${DEVBOX_ALLOW_MERGE:-0}" = "1" ] && merges="allowed (DEVBOX_ALLOW_MERGE=1)"

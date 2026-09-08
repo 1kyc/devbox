@@ -109,6 +109,30 @@ else
   bad "could not create a worktree (test inconclusive)"
 fi
 
+echo "== protected branches tolerate any whitespace, as documented =="
+# The list is documented "space separated" and was consumed by `for p in
+# $protected`, which splits on IFS. A flattening to a literal-space glob kept
+# "main master" working and silently stopped protecting main for a tab or a
+# newline — a widening you would only discover from a push that succeeded.
+cd /tmp/t/repo && git switch -q main 2>/dev/null || git checkout -q main 2>/dev/null
+for sep in ' ' '	' '
+'; do
+  out=$(DEVBOX_PROTECTED_BRANCHES="main${sep}master" git push origin main 2>&1); rc=$?
+  case "$sep" in
+    ' ')  label="space" ;;
+    '	') label="tab" ;;
+    *)    label="newline" ;;
+  esac
+  { [ $rc -ne 0 ] && echo "$out" | grep -q "refusing to push"; } \
+    && ok "separated by a $label: push to main refused" \
+    || bad "separated by a $label: push to main ALLOWED (rc=$rc)"
+done
+# An empty value must still mean "protect nothing".
+git push -q origin main 2>/dev/null; rc=$?
+out=$(DEVBOX_PROTECTED_BRANCHES="" git push origin main 2>&1); rc=$?
+[ $rc -eq 0 ] && ok "an empty list still disables the guard" \
+  || bad "empty list did not disable the guard (rc=$rc): $out"
+
 echo "== gh merge shim =="
 out=$(gh pr merge 1 2>&1); rc=$?
 { [ $rc -ne 0 ] && echo "$out" | grep -q "merging is disabled"; } \

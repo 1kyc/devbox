@@ -418,6 +418,70 @@ out=$( export PATH="/tmp/fakebin:$PATH" DEVBOX_PLAYGROUND="$PLAY" \
   || bad "XDG store missed (rc=$rc): $out"
 rm -rf "$SANDBOX/xdg" "$SANDBOX/emptycfg"
 
+echo "== a repository is found by having a .git, not by its name =="
+# An optimisation once pruned node_modules/.venv/vendor/target by name to avoid
+# walking dependency trees — and so skipped a top-level repo *called* target.
+# It vanished from the scan, took the empty-playground exception, and switched
+# token-scope enforcement off entirely.
+for n in target vendor node_modules .venv; do
+  rm -rf "$PLAY"; mkdir -p "$PLAY/$n"
+  git init -q "$PLAY/$n"
+  git -C "$PLAY/$n" remote add origin "https://github.com/tester/$n.git"
+  mkgh "github_pat_x" '[
+   {"full_name":"tester/'"$n"'","private":false,"permissions":{"push":true}},
+   {"full_name":"tester/secrets","private":true,"permissions":{"push":true}}]'
+  out=$(run); rc=$?
+  { [ $rc -ne 0 ] && echo "$out" | grep -q "not checked out in this box"; } \
+    && ok "a repo named '$n' is scanned, and drift is still caught" \
+    || bad "repo named '$n' was skipped, disabling scope enforcement (rc=$rc)"
+done
+
+echo "== an unreadable store stops the box on its own =="
+# Not merely one more entry in the count: a legacy file holding TWO hosts
+# collapses to one "?unparsed" line, so with a selected token that verifies
+# cleanly the box used to start — with a second, classic token in the same file.
+mkplay tester/alpha tester/beta
+mkgh "github_pat_x" "$SCOPED"          # the SELECTED token is perfectly scoped
+cat > "$GHCFG/hosts.yml" <<'EOF'
+github.com:
+    oauth_token: github_pat_x
+    user: someone
+ghe.example.com:
+    oauth_token: ghp_classicENTERPRISE
+    user: someone
+EOF
+out=$(run); rc=$?
+{ [ $rc -ne 0 ] && echo "$out" | grep -q "could not be fully read"; } \
+  && ok "an unparsed store is refused even when the selected token is fine" \
+  || bad "unparsed store passed behind a good token (rc=$rc): $out"
+rm -f "$GHCFG/hosts.yml"
+
+echo "== the guard state is unknown, not assumed, when it cannot be observed =="
+# The playground is normally a folder OF repos, so `git rev-parse --git-path
+# hooks` fails there — and a fallback turned that failure into "active",
+# printing "push blocked" with hooks redirected to an empty directory.
+mkplay tester/alpha tester/beta
+mkgh "github_pat_x" "$SCOPED"
+mkdir -p "$SANDBOX/evilhooks"
+out=$( export PATH="/tmp/fakebin:$PATH" DEVBOX_PLAYGROUND="$PLAY" \
+              GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath \
+              GIT_CONFIG_VALUE_0="$SANDBOX/evilhooks"; \
+       cd "$PLAY" && bash "$SETUP" 2>&1 )
+echo "$out" | grep -q "GUARD NOT ACTIVE" \
+  && ok "hooks pointed elsewhere are reported as NOT active" \
+  || bad "redirected hooks still reported as blocking: $(echo "$out" | grep protected)"
+echo "$out" | grep -q "pre-push guard is NOT active" \
+  && ok "and warned about explicitly" || bad "no warning for redirected hooks"
+
+# No repo and no config: unknown, and said so rather than assumed fine.
+rm -rf "$PLAY"; mkdir -p "$PLAY"
+out=$( export PATH="/tmp/fakebin:$PATH" DEVBOX_PLAYGROUND="$PLAY" \
+              GIT_CONFIG_COUNT=0; \
+       cd "$PLAY" && bash "$SETUP" 2>&1 )
+echo "$out" | grep -qE "UNVERIFIED|could not determine" \
+  && ok "an unobservable guard is reported unknown, not active" \
+  || bad "unobservable guard claimed active: $(echo "$out" | grep -E 'protected|determine')"
+
 echo "== a store this parser cannot read is not an empty store =="
 # gh's older single-account format has no `users:` block. The awk saw zero
 # accounts and "zero accounts" read as "no credentials", so a classic token in

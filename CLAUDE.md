@@ -42,8 +42,19 @@ bash tests/worktree-roundtrip.sh
 bash tests/launcher.sh
 ```
 
-All four must be green (146 assertions). The fail-closed suite uses a fake `gh`,
+All four must be green (162 assertions). The fail-closed suite uses a fake `gh`,
 so it needs no credentials; the others run against the real box.
+
+## Editing from Windows
+
+Writing these files through a `\\wsl.localhost\...` UNC path **drops the
+executable bit**. It has happened twice, and three of the four files were
+invisible both times because the Dockerfile `COPY --chmod=0755`s them, so the
+image was right while the repo was wrong.
+
+After any editing session: `chmod +x bin/devbox setup.sh guards/bin/* guards/hooks/* tests/*.sh`,
+then `git add -A` so the index records mode 100755. `tests/launcher.sh` asserts
+this for every tracked script and will fail loudly if you forget.
 
 ## Host notes
 
