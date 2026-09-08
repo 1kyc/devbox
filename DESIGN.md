@@ -149,6 +149,35 @@ unauthenticated, or `DEVBOX_ALLOW_BROAD_TOKEN=1` if you know what the token is.
 to re-check a box that has been up for weeks — a token can be re-scoped, or
 replaced by `gh auth login`, long after boot.
 
+### One account, not one active account
+
+`gh auth token` returns the **active** account's token, but gh stores
+credentials per account and keeps the inactive ones fully usable:
+`gh auth token --user other` hands them over, and `gh auth switch` promotes
+them. So validating the active token says nothing about what an agent can
+reach — a narrow active account can sit in front of a classic token belonging
+to an account that was never examined.
+
+The box requires a **single stored account** rather than validating each one and
+unioning their scopes. Its premise is one identity with one auditable scope; a
+second set of credentials in it is the thing to remove, not to measure. That is
+also the concrete risk for a personal box: the account you did not mean to bring
+in is usually the work one.
+
+Accounts are enumerated from `hosts.yml` rather than `gh auth status`, because
+enumeration has to work with no network — the same reason the check keys off a
+stored token in the first place. The API calls then pin `GH_TOKEN` to the exact
+token that was classified, so a switch between "which token is this" and "what
+does it reach" cannot judge one token by another's scope.
+
+### Report what happened, not what was attempted
+
+Every removal in `check_host_bleed` verifies that it worked. An earlier version
+deleted `~/.docker/config.json` and announced the deletion unconditionally; with
+a read-only `~/.docker` the file survived, the message said it had gone, and
+nothing was marked unresolved. A check that lies is worse than no check, because
+it also removes the reason to look.
+
 ### Boot is the only automatic check
 
 `check_host_bleed` is **fatal** at startup. The per-repo dev container could let

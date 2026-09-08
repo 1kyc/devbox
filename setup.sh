@@ -65,12 +65,21 @@ check_host_bleed() {
   # on your host.
   if [ -s "$HOME/.docker/config.json" ] \
      && grep -q '"auths"' "$HOME/.docker/config.json" 2>/dev/null; then
-    rm -f "$HOME/.docker/config.json"
     leaks=1
     warn ""
-    warn "  !! devbox: deleted host Docker registry credentials that something"
-    warn "     copied in. If this was VS Code, set"
-    warn "     \"dev.containers.dockerCredentialHelper\": false."
+    # Say what happened, not what was attempted. Announcing a deletion that
+    # silently failed is worse than not checking at all.
+    if rm -f "$HOME/.docker/config.json" 2>/dev/null \
+       && [ ! -e "$HOME/.docker/config.json" ]; then
+      warn "  !! devbox: deleted host Docker registry credentials that something"
+      warn "     copied in. If this was VS Code, set"
+      warn "     \"dev.containers.dockerCredentialHelper\": false."
+    else
+      unfixed=1
+      warn "  !! devbox: COULD NOT REMOVE host Docker registry credentials at"
+      warn "     $HOME/.docker/config.json — they are readable by anything in"
+      warn "     this container. Check the permissions on $HOME/.docker."
+    fi
   fi
 
   # Any credential helper that is not ours points somewhere we do not control —
@@ -270,6 +279,29 @@ BROAD_REASON=""
 #   no token stored          -> unauthenticated, safe, box starts
 #   token stored, verified   -> judged on its scope, below
 #   token stored, unverified -> a working token of unknown reach: hard stop
+
+# Every account whose credentials are stored in this container, as host/account.
+#
+# Read from hosts.yml rather than `gh auth status`, because this has to work
+# with no network — the whole point of the check above is that a stored token
+# outlives a failed status call.
+gh_stored_accounts() {
+  local hosts="${GH_CONFIG_DIR:-$HOME/.config/gh}/hosts.yml"
+  [ -f "$hosts" ] || return 0
+  # Accounts are the keys one level inside a host's `users:` block. The first
+  # key encountered fixes the indent, so 2- and 4-space files both parse.
+  awk '
+    { match($0, /^[ \t]*/); ind = RLENGTH }
+    /^[^ \t#]/ && /:[ \t]*$/ { host = $0; sub(/:[ \t]*$/, "", host); inu = 0; next }
+    /^[ \t]*users:[ \t]*$/   { inu = 1; uind = ind; aind = -1; next }
+    inu && NF && ind <= uind { inu = 0 }
+    inu && /:[ \t]*$/ {
+      if (aind < 0) aind = ind
+      if (ind == aind) { a = $0; gsub(/[ \t]/, "", a); sub(/:$/, "", a); print host "/" a }
+    }
+  ' "$hosts"
+}
+
 verify_token() {
   STORED_TOKEN="$(gh auth token 2>/dev/null || true)"
   if [ -z "$STORED_TOKEN" ]; then
@@ -279,6 +311,23 @@ verify_token() {
   GH_READY=1
   GH_AUTH_OK=0
   gh auth status >/dev/null 2>&1 && GH_AUTH_OK=1
+
+  # `gh auth token` returns the ACTIVE account's token, but gh stores one set of
+  # credentials per account and keeps the inactive ones fully usable:
+  # `gh auth token --user other` hands them over, and `gh auth switch` makes
+  # them active. Validating only the active token therefore says nothing about
+  # what an agent can actually reach — a narrow active account can sit in front
+  # of a classic token belonging to an account we never looked at.
+  #
+  # Rather than validating each one and unioning their scopes, require a single
+  # account. The premise of this box is one identity with one auditable scope;
+  # a second set of credentials in it is the thing to remove, not to measure.
+  ACCOUNTS="$(gh_stored_accounts)"
+  ACCOUNT_COUNT="$(printf '%s\n' "$ACCOUNTS" | grep -c . || true)"
+  if [ "$ACCOUNT_COUNT" -gt 1 ] 2>/dev/null; then
+    TOKEN_BROAD=1
+    BROAD_REASON="${BROAD_REASON:-$ACCOUNT_COUNT GitHub accounts are stored in this container, and only the active one can be checked}"
+  fi
 
   case "$STORED_TOKEN" in
     github_pat_*) TOKEN_KIND="fine-grained" ;;
@@ -310,7 +359,11 @@ verify_token() {
   #
   # --paginate because the cap is 100 per page: without it, a token whose extra
   # repositories happen to sort onto page two would sail through.
-  if repos_json="$(gh api --paginate 'user/repos?per_page=100' 2>/dev/null)"; then
+  #
+  # GH_TOKEN pins the call to the exact token classified above. Without it, gh
+  # would resolve the account itself, so a switch between the two lines would
+  # mean judging one token by another's scope.
+  if repos_json="$(GH_TOKEN="$STORED_TOKEN" gh api --paginate 'user/repos?per_page=100' 2>/dev/null)"; then
     # A jq failure means the answer is unparseable, not that the token is
     # narrow — pipefail makes the assignment fail so it lands in the same
     # "unverifiable" branch rather than looking like an empty result.
@@ -365,6 +418,15 @@ verify_token() {
       warn "  !! devbox: the GitHub token in this container is too broad —"
       warn "     $BROAD_REASON."
       warn ""
+      if [ "${ACCOUNT_COUNT:-0}" -gt 1 ] 2>/dev/null; then
+        warn "     Stored accounts:"
+        printf '%s\n' "$ACCOUNTS" | sed 's/^/       /' >&2
+        warn ""
+        warn "     Any of these is one 'gh auth switch' away from being the"
+        warn "     active one, so keep exactly the account this box works as:"
+        printf '%s\n' "$ACCOUNTS" | sed 's#^\(.*\)/\(.*\)$#       gh auth logout -h \1 -u \2#' >&2
+        warn ""
+      fi
       if [ -n "$EXTRA_LIST" ] && [ "$EXTRA_COUNT" -gt 0 ] 2>/dev/null; then
         warn "     Reaches, but not checked out here:"
         printf '%s\n' "$EXTRA_LIST" | head -20 | sed 's/^/       /' >&2

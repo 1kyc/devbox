@@ -203,6 +203,72 @@ out=$(run); rc=$?
   && ok "no token stored at all: starts unauthenticated (safe)" \
   || bad "unauthenticated start failed (rc=$rc): $out"
 
+echo "== only one GitHub account may be stored =="
+# `gh auth token` returns the ACTIVE account's token, but gh keeps inactive
+# accounts fully usable: `gh auth token --user other` hands them over and
+# `gh auth switch` promotes them. A narrow active account in front of a classic
+# one used to pass, because only the active token was ever examined.
+GHCFG="$HOME/.config/gh"; mkdir -p "$GHCFG"
+[ -f "$GHCFG/hosts.yml" ] && cp "$GHCFG/hosts.yml" /tmp/hosts.bak
+mkplay tester/alpha tester/beta
+mkgh "github_pat_x" "$SCOPED"        # the ACTIVE token is perfectly scoped
+cat > "$GHCFG/hosts.yml" <<'EOF'
+github.com:
+    users:
+        narrow:
+            oauth_token: github_pat_x
+        broad:
+            oauth_token: ghp_classicbroadtoken
+    git_protocol: https
+    user: narrow
+    oauth_token: github_pat_x
+EOF
+out=$(run); rc=$?
+{ [ $rc -ne 0 ] && echo "$out" | grep -q "GitHub accounts are stored"; } \
+  && ok "a second stored account is refused even when the ACTIVE token is fine" \
+  || bad "second account accepted (rc=$rc): $out"
+echo "$out" | grep -q "gh auth logout -h github.com -u broad" \
+  && ok "prints the exact logout command for each account" \
+  || bad "no per-account logout command offered"
+
+# One account must still be fine, including a 2-space file.
+cat > "$GHCFG/hosts.yml" <<'EOF'
+github.com:
+  users:
+    narrow:
+      oauth_token: github_pat_x
+  git_protocol: https
+  user: narrow
+  oauth_token: github_pat_x
+EOF
+out=$(run); rc=$?
+[ $rc -eq 0 ] && ok "a single account parses and passes (2-space indent)" \
+  || bad "single account rejected (rc=$rc): $out"
+rm -f "$GHCFG/hosts.yml"
+[ -f /tmp/hosts.bak ] && mv /tmp/hosts.bak "$GHCFG/hosts.yml"
+
+echo "== undeletable Docker credentials are fatal, not announced as deleted =="
+# The message used to claim deletion regardless of whether rm worked.
+rm -rf "$HOME/.docker"; mkdir -p "$HOME/.docker"
+printf '{"auths":{"ghcr.io":{"auth":"ZmFrZQ=="}}}\n' > "$HOME/.docker/config.json"
+chmod 500 "$HOME/.docker"            # readable, not writable: rm must fail
+mkgh "github_pat_x" "$SCOPED"
+out=$(run); rc=$?
+{ [ $rc -ne 0 ] && echo "$out" | grep -q "COULD NOT REMOVE host Docker"; } \
+  && ok "credentials it cannot delete are fatal" \
+  || bad "undeletable docker creds did not stop the box (rc=$rc): $out"
+echo "$out" | grep -q "deleted host Docker" \
+  && bad "still claims it deleted them" || ok "does not claim a deletion that failed"
+chmod 700 "$HOME/.docker"
+
+# ...and when it CAN delete them, it does, and says so.
+out=$(run); rc=$?
+{ [ $rc -eq 0 ] && [ ! -e "$HOME/.docker/config.json" ] \
+  && echo "$out" | grep -q "deleted host Docker"; } \
+  && ok "credentials it can delete are removed and the box starts" \
+  || bad "deletable docker creds mishandled (rc=$rc)"
+rm -rf "$HOME/.docker"
+
 echo "== --audit checks token scope too =="
 mkgh "github_pat_x" "$DRIFTED"
 out=$( export PATH="/tmp/fakebin:$PATH" DEVBOX_PLAYGROUND="$PLAY"; cd "$PLAY" && bash "$SETUP" --audit 2>&1 ); rc=$?
