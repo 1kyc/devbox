@@ -150,6 +150,119 @@ out=$(DEVBOX_ALLOW_BROAD_TOKEN=1 run); rc=$?
 { [ $rc -eq 0 ] && echo "$out" | grep -q "DEVBOX_ALLOW_BROAD_TOKEN=1"; } \
   && ok "the override lets a broad token through, loudly" || bad "override failed (rc=$rc)"
 
+echo '== a stored token is checked even when "gh auth status" fails =='
+# The regression this guards: keying validation off `gh auth status` meant a
+# network failure looked like "not logged in". The token stays on disk and works
+# again the moment connectivity returns — and this box runs for weeks without
+# re-checking. A classic token used to start the box this way.
+mkplay tester/alpha tester/beta
+cat > /tmp/fakebin/gh <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+  "auth status") exit 1 ;;                                    # looks offline
+  "auth token")  echo "ghp_classicclassicclassic"; exit 0 ;;  # ...token still stored
+esac
+exit 1
+EOF
+chmod +x /tmp/fakebin/gh
+out=$(run); rc=$?
+{ [ $rc -ne 0 ] && echo "$out" | grep -q "classic token"; } \
+  && ok "a stored classic token is refused even with auth status failing" \
+  || bad "offline classic token started the box (rc=$rc): $out"
+echo "$out" | grep -q "gh auth logout" \
+  && ok "tells you how to start with no GitHub access at all" \
+  || bad "no escape hatch offered"
+
+# ...and a fine-grained token whose scope cannot be read is equally a stop,
+# rather than being mistaken for "not logged in".
+cat > /tmp/fakebin/gh <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+  "auth status") exit 1 ;;
+  "auth token")  echo "github_pat_x"; exit 0 ;;
+esac
+exit 1
+EOF
+chmod +x /tmp/fakebin/gh
+out=$(run); rc=$?
+{ [ $rc -ne 0 ] && echo "$out" | grep -q "scope could not be verified"; } \
+  && ok "a stored token of unreadable scope is refused" \
+  || bad "unverifiable stored token started the box (rc=$rc)"
+
+# The genuinely-unauthenticated case must still start: NO token on disk.
+cat > /tmp/fakebin/gh <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+  "auth token") exit 1 ;;
+esac
+exit 1
+EOF
+chmod +x /tmp/fakebin/gh
+out=$(run); rc=$?
+{ [ $rc -eq 0 ] && echo "$out" | grep -q "one-time GitHub setup needed"; } \
+  && ok "no token stored at all: starts unauthenticated (safe)" \
+  || bad "unauthenticated start failed (rc=$rc): $out"
+
+echo "== --audit checks token scope too =="
+mkgh "github_pat_x" "$DRIFTED"
+out=$( export PATH="/tmp/fakebin:$PATH" DEVBOX_PLAYGROUND="$PLAY"; cd "$PLAY" && bash "$SETUP" --audit 2>&1 ); rc=$?
+{ [ $rc -ne 0 ] && echo "$out" | grep -q "not checked out in this box"; } \
+  && ok "audit catches a drifted token (not just guards)" \
+  || bad "audit ignored token scope (rc=$rc): $out"
+mkgh "github_pat_x" "$SCOPED"
+( export PATH="/tmp/fakebin:$PATH" DEVBOX_PLAYGROUND="$PLAY"; cd "$PLAY" && bash "$SETUP" --audit >/dev/null 2>&1 ) \
+  && ok "audit still passes on a correctly scoped token" || bad "audit false positive"
+
+echo "== an unremovable credential bridge is fatal at STARTUP =="
+# Previously `check_host_bleed || true`: the check ran, found something it could
+# not remove, and the box started anyway. Nothing here re-runs audit on a
+# schedule, so boot is the only automatic check there is.
+#
+# Simulated with a live agent socket in a directory we can read but not write,
+# which is exactly the "detected but unremovable" shape.
+LOCK=/tmp/lockdir
+rm -rf "$LOCK"; mkdir -p "$LOCK"
+perl -MIO::Socket::UNIX -e \
+  'IO::Socket::UNIX->new(Local=>q('"$LOCK"'/vscode-ssh-auth-x.sock), Listen=>1) or die; sleep 60' &
+sockpid=$!
+timeout 10 bash -c "until [ -S $LOCK/vscode-ssh-auth-x.sock ]; do :; done"
+chmod 500 "$LOCK"
+if [ -S "$LOCK/vscode-ssh-auth-x.sock" ]; then
+  mkgh "github_pat_x" "$SCOPED"
+  out=$( export PATH="/tmp/fakebin:$PATH" DEVBOX_PLAYGROUND="$PLAY" TMPDIR="$LOCK"; \
+         cd "$PLAY" && bash "$SETUP" 2>&1 ); rc=$?
+  { [ $rc -ne 0 ] && echo "$out" | grep -q "COULD NOT REMOVE"; } \
+    && ok "startup FAILS on a bridge it cannot remove" \
+    || bad "startup continued despite an unremovable bridge (rc=$rc): $out"
+  echo "$out" | grep -q "devbox ready" && bad "still printed 'devbox ready'" || ok "did not print 'devbox ready'"
+else
+  bad "could not create the locked socket (test inconclusive)"
+fi
+kill "${sockpid:-0}" 2>/dev/null
+chmod 700 "$LOCK" 2>/dev/null; rm -rf "$LOCK"
+
+echo "== a socket it CAN remove is removed, and startup continues =="
+mkgh "github_pat_x" "$SCOPED"
+FREE=/tmp/freedir; rm -rf "$FREE"; mkdir -p "$FREE"
+perl -MIO::Socket::UNIX -e \
+  'IO::Socket::UNIX->new(Local=>q('"$FREE"'/vscode-ssh-auth-y.sock), Listen=>1) or die; sleep 60' &
+sockpid=$!
+timeout 10 bash -c "until [ -S $FREE/vscode-ssh-auth-y.sock ]; do :; done"
+out=$( export PATH="/tmp/fakebin:$PATH" DEVBOX_PLAYGROUND="$PLAY" TMPDIR="$FREE"; \
+       cd "$PLAY" && bash "$SETUP" 2>&1 ); rc=$?
+{ [ $rc -eq 0 ] && [ ! -e "$FREE/vscode-ssh-auth-y.sock" ]; } \
+  && ok "removable socket is deleted and the box still starts" \
+  || bad "removable socket handling wrong (rc=$rc, socket present: $([ -e "$FREE/vscode-ssh-auth-y.sock" ] && echo yes || echo no))"
+kill "${sockpid:-0}" 2>/dev/null; rm -rf "$FREE"
+
+echo "== a dangling SSH_AUTH_SOCK is inert, not fatal =="
+mkgh "github_pat_x" "$SCOPED"
+out=$( export PATH="/tmp/fakebin:$PATH" DEVBOX_PLAYGROUND="$PLAY" SSH_AUTH_SOCK=/tmp/nothing-here.sock; \
+       cd "$PLAY" && bash "$SETUP" 2>&1 ); rc=$?
+{ [ $rc -eq 0 ] && echo "$out" | grep -q "Nothing is listening there"; } \
+  && ok "a value pointing at no socket warns but does not stop the box" \
+  || bad "dangling SSH_AUTH_SOCK handling wrong (rc=$rc): $out"
+
 echo "== unverifiable vs offline =="
 # A token that authenticates but whose scope cannot be read is a stop: unknown
 # scope is not something to point an unattended agent at.

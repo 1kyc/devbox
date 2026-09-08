@@ -120,10 +120,46 @@ Every hard stop has a named override (`DEVBOX_ALLOW_BROAD_TOKEN`,
 `DEVBOX_ALLOW_MERGE`) so that "I meant that" is expressible without editing
 code.
 
-Note the asymmetry between two failures that look similar: **offline** leaves
-`gh auth status` failing, so the box comes up unauthenticated — safe, nothing
-can be pushed anywhere. **Authenticated but unable to read scope** is a stop,
-because that is a working token of unknown reach.
+### Stored, not "logged in"
+
+The token check keys off whether a token is **stored**, not whether
+`gh auth status` succeeds. Those look interchangeable and are not.
+
+An earlier version used `gh auth status`, reasoning that a failure meant
+offline, and offline is safe because nothing can be pushed anywhere. That is
+wrong in a way that only shows up in a long-lived box: a network failure does
+not remove the token. It sits on disk, `gh auth token` still returns it, and it
+works again the moment connectivity comes back — but `setup.sh` ran once, at
+boot, and does not re-check. A **classic token**, the exact thing this check
+exists to reject, started the box that way.
+
+So the three states are kept distinct:
+
+| | |
+|---|---|
+| No token on disk | unauthenticated, safe — box starts |
+| Token whose scope verifies | judged on that scope |
+| Token whose scope will not verify | a working token of unknown reach — **stop** |
+
+Being genuinely offline with a token stored now lands in the third row. That is
+intended: the escape hatch is `gh auth logout`, which makes the box honestly
+unauthenticated, or `DEVBOX_ALLOW_BROAD_TOKEN=1` if you know what the token is.
+
+`--audit` runs the same verification (minus the writes), so it is also the way
+to re-check a box that has been up for weeks — a token can be re-scoped, or
+replaced by `gh auth login`, long after boot.
+
+### Boot is the only automatic check
+
+`check_host_bleed` is **fatal** at startup. The per-repo dev container could let
+it slide at create time, because the editor's SSH proxy did not exist yet and a
+later `postAttach --audit` would catch it. Nothing here runs `--audit` on a
+schedule, so a credential bridge that survives boot survives for the life of the
+box.
+
+The SSH_AUTH_SOCK case is judged on whether it reaches a **live** socket rather
+than on the variable being set: a dangling value is inert and warns, a live
+agent socket is removed, and one that cannot be removed is fatal.
 
 ## Where things live, and why
 

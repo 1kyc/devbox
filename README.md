@@ -54,6 +54,7 @@ devbox cc           # claude, bypass mode
 devbox cx           # codex, bypass mode
 devbox logs         # what setup.sh said at boot — start here when it will not come up
 devbox rebuild      # pull base images, rebuild, recreate
+devbox audit        # re-check guards, host bleed and token scope on a live box
 ```
 
 ## The token
@@ -73,15 +74,24 @@ against the repositories checked out in the playground:
 |---|---|
 | Token reaches a repo that is **not** in the box | **hard stop**, names the repo |
 | Classic or OAuth token | **hard stop** — those carry your whole account |
-| Scope cannot be verified (API error, unparseable answer) | **hard stop** |
+| Scope cannot be verified (API error, offline, unparseable answer) | **hard stop** |
 | A repo in the box the token cannot push to | warning, box starts |
 | Playground empty (fresh box) | reported, box starts |
-| Not logged in at all | box starts unauthenticated, prints instructions |
+| No token stored at all | box starts unauthenticated, prints instructions |
 
 That comparison runs in the direction that matters. The predictable way this
 setup rots is that you clone something new, hit a 403, widen the token, and
 repeat until it covers your whole account — checking against what is actually
 checked out turns that drift into a startup failure instead of a slow leak.
+
+Note the last two rows: the check keys off whether a token is **stored**, not
+whether `gh auth status` succeeds. A network failure leaves the token on disk
+and fully usable once connectivity returns, so "offline" is not treated as
+"logged out". If you want a box with no GitHub access, `gh auth logout` — that
+is the honest version of it.
+
+`devbox audit` re-runs the same verification against a box that is already up,
+which is how you re-check after re-scoping a token or running `gh auth login`.
 
 Override with `DEVBOX_ALLOW_BROAD_TOKEN=1` in `.env` if you mean it.
 
@@ -167,9 +177,10 @@ re-download the world.
 docker cp tests/in-container.sh devbox:/tmp/t.sh && docker compose exec devbox bash /tmp/t.sh
 docker cp tests/failclosed.sh   devbox:/tmp/f.sh && docker compose exec devbox bash /tmp/f.sh
 bash tests/worktree-roundtrip.sh
+bash tests/launcher.sh
 ```
 
-87 assertions: the box's invariants, the scope check's refusals (with a fake
+107 assertions: the box's invariants, the scope check's refusals (with a fake
 `gh`), and the worktree round-trip.
 
 ## Troubleshooting

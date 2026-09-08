@@ -27,14 +27,19 @@ if [ ! -f .env ]; then
   exit 1
 fi
 
-dc() { docker compose "$@"; }
+# `exec` needs a real executable, so every dispatch below spells out
+# `docker compose`. An earlier version wrapped it in a shell function and
+# exec'd that, which fails with "exec: dc: not found" on every subcommand.
+# tests/launcher.sh exists because of it.
 
 # The box is only useful when it is up; shelling into a stopped box should start
 # it rather than erroring at you.
 ensure_up() {
-  if [ -z "$(dc ps -q devbox 2>/dev/null)" ] \
-     || [ "$(docker inspect -f '{{.State.Running}}' "$(dc ps -q devbox)" 2>/dev/null)" != true ]; then
-    dc up -d
+  local id
+  id="$(docker compose ps -q devbox 2>/dev/null)"
+  if [ -z "$id" ] \
+     || [ "$(docker inspect -f '{{.State.Running}}' "$id" 2>/dev/null)" != true ]; then
+    docker compose up -d
   fi
 }
 
@@ -42,15 +47,15 @@ cmd="${1:-shell}"
 [ $# -gt 0 ] && shift
 
 case "$cmd" in
-  shell|sh) ensure_up; exec dc exec devbox bash -l ;;
-  cc)       ensure_up; exec dc exec devbox bash -lc 'claude --dangerously-skip-permissions "$@"' _ "$@" ;;
-  cx)       ensure_up; exec dc exec devbox bash -lc 'codex --dangerously-bypass-approvals-and-sandbox "$@"' _ "$@" ;;
-  run)      ensure_up; exec dc exec devbox bash -lc "$*" ;;
-  audit)    ensure_up; exec dc exec devbox /usr/local/share/devbox/setup.sh --audit ;;
-  up)       exec dc up -d "$@" ;;
-  down)     exec dc down "$@" ;;
-  logs)     exec dc logs "$@" devbox ;;
-  status)   exec dc ps ;;
-  rebuild)  dc build --pull "$@"; exec dc up -d --force-recreate ;;
-  *)        exec dc "$cmd" "$@" ;;
+  shell|sh) ensure_up; exec docker compose exec devbox bash -l ;;
+  cc)       ensure_up; exec docker compose exec devbox bash -lc 'claude --dangerously-skip-permissions "$@"' _ "$@" ;;
+  cx)       ensure_up; exec docker compose exec devbox bash -lc 'codex --dangerously-bypass-approvals-and-sandbox "$@"' _ "$@" ;;
+  run)      ensure_up; exec docker compose exec devbox bash -lc "$*" ;;
+  audit)    ensure_up; exec docker compose exec devbox /usr/local/share/devbox/setup.sh --audit ;;
+  up)       exec docker compose up -d "$@" ;;
+  down)     exec docker compose down "$@" ;;
+  logs)     exec docker compose logs "$@" devbox ;;
+  status)   exec docker compose ps ;;
+  rebuild)  docker compose build --pull "$@" && exec docker compose up -d --force-recreate ;;
+  *)        exec docker compose "$cmd" "$@" ;;
 esac

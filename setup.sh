@@ -134,11 +134,29 @@ check_host_bleed() {
     done
     warn "     Fix it at the source: stop attaching an editor to this container,"
     warn "     or stop the agent on the host."
-  elif [ -n "${SSH_AUTH_SOCK:-}" ]; then
+  fi
+
+  # SSH_AUTH_SOCK pointing somewhere we did not recognise. What matters is not
+  # the variable but whether it reaches a LIVE agent: a dangling value is inert,
+  # a live socket is a key to every host you can ssh to. So try to remove it,
+  # and treat one that survives as unfixed rather than as a note.
+  if [ -n "${SSH_AUTH_SOCK:-}" ]; then
     leaks=1
     warn ""
-    warn "  !! devbox: SSH_AUTH_SOCK is set ($SSH_AUTH_SOCK) but no forwarded"
-    warn "     socket was found. Check what set it."
+    warn "  !! devbox: SSH_AUTH_SOCK is set to $SSH_AUTH_SOCK"
+    if [ -S "$SSH_AUTH_SOCK" ]; then
+      if rm -f "$SSH_AUTH_SOCK" 2>/dev/null && [ ! -e "$SSH_AUTH_SOCK" ]; then
+        warn "     It was a live agent socket. Removed."
+      else
+        unfixed=1
+        warn "     It is a LIVE agent socket and could not be removed."
+        warn "     Anything in this container can use it to reach every host you"
+        warn "     can ssh to. Find what mounted or created it."
+      fi
+    else
+      warn "     Nothing is listening there, so it is inert — but something set"
+      warn "     it, and compose.yaml sets it empty. Check what did."
+    fi
   fi
 
   [ "$leaks" = 1 ] && warn ""
@@ -201,38 +219,6 @@ check_guards() {
   esac
 }
 
-if [ "$MODE" = audit ]; then
-  check_host_bleed || die "a forwarded SSH agent is still reachable in this container."
-  check_guards
-  exit 0
-fi
-
-# ---------------------------------------------------------------------------
-# 1. Git, in the container's own global config.
-# ---------------------------------------------------------------------------
-must git config --global init.defaultBranch main
-# There is no signing key in here; leave signing to your host.
-must git config --global commit.gpgsign false
-must git config --global tag.gpgsign false
-
-# No safe.directory entries. The container user shares your host uid, so
-# bind-mounted repos are genuinely owned by the user running git and the
-# dubious-ownership check never fires — which is better than suppressing it,
-# because the check still works if that assumption ever breaks.
-
-# If a repo's origin is an SSH URL, rewrite it to HTTPS *for this container
-# only* — there is no SSH key in here, but there is a GitHub token. A global
-# url.insteadOf rule leaves each repo's own .git/config, shared with your host
-# through the bind mount, untouched.
-git config --global --unset-all url."https://github.com/".insteadOf 2>/dev/null || true
-must git config --global --add url."https://github.com/".insteadOf "git@github.com:"
-must git config --global --add url."https://github.com/".insteadOf "ssh://git@github.com/"
-
-# ---------------------------------------------------------------------------
-# 2. Keep the host out.
-# ---------------------------------------------------------------------------
-check_host_bleed || true
-
 # ---------------------------------------------------------------------------
 # 3. GitHub: identity and credentials, from the token in `gh`.
 #
@@ -271,30 +257,31 @@ NOPUSH_LIST=""
 TOKEN_BROAD=0
 BROAD_REASON=""
 
-if gh auth status >/dev/null 2>&1; then
+# Verification only — it writes nothing, so --audit can call it too. Dies if the
+# token is not one this box is willing to run agents against.
+#
+# The gate is whether a token is STORED, not whether `gh auth status` succeeds.
+# Those differ in exactly the case that matters: a network failure makes the
+# status check fail while leaving the token on disk, fully usable the moment
+# connectivity returns. Keying off status let a classic token — the very thing
+# this function exists to reject — start the box, and this box then runs for
+# weeks without re-checking.
+#
+#   no token stored          -> unauthenticated, safe, box starts
+#   token stored, verified   -> judged on its scope, below
+#   token stored, unverified -> a working token of unknown reach: hard stop
+verify_token() {
+  STORED_TOKEN="$(gh auth token 2>/dev/null || true)"
+  if [ -z "$STORED_TOKEN" ]; then
+    GH_READY=0
+    return 0
+  fi
   GH_READY=1
+  GH_AUTH_OK=0
+  gh auth status >/dev/null 2>&1 && GH_AUTH_OK=1
 
-  name="${DEVBOX_GIT_NAME:-}"
-  email="${DEVBOX_GIT_EMAIL:-}"
-  if [ -z "$name" ] || [ -z "$email" ]; then
-    login="$(gh api user -q .login 2>/dev/null || true)"
-    uid="$(gh api user -q .id 2>/dev/null || true)"
-    if [ -n "$login" ] && [ -n "$uid" ]; then
-      name="${name:-$login}"
-      email="${email:-${uid}+${login}@users.noreply.github.com}"
-    fi
-  fi
-  if [ -n "$name" ] && [ -n "$email" ]; then
-    must git config --global user.name "$name"
-    must git config --global user.email "$email"
-  fi
-
-  gh auth setup-git >/dev/null 2>&1 \
-    || warn "devbox: gh auth setup-git failed; git push may not authenticate."
-
-  case "$(gh auth token 2>/dev/null || true)" in
+  case "$STORED_TOKEN" in
     github_pat_*) TOKEN_KIND="fine-grained" ;;
-    "")           TOKEN_KIND="unknown" ;;
     gho_*)        TOKEN_KIND="oauth"
                   TOKEN_BROAD=1
                   BROAD_REASON="it is an OAuth token from a browser login, which carries your whole account's access" ;;
@@ -392,10 +379,85 @@ if gh auth status >/dev/null 2>&1; then
       warn "       Permissions: Contents RW, Pull requests RW, Metadata RO"
       warn "     then:  gh auth login --hostname github.com --git-protocol https"
       warn ""
+      if [ "$GH_AUTH_OK" = 0 ]; then
+        warn "     Offline? The token is still on disk and becomes usable again"
+        warn "     the moment the network returns, so it is checked either way."
+        warn "     To start without GitHub access at all:  gh auth logout"
+        warn ""
+      fi
       warn "     Deliberate? Set DEVBOX_ALLOW_BROAD_TOKEN=1 in your .env."
       die "refusing to run agents in bypass mode against a token this wide."
     fi
   fi
+}
+
+# --audit is the same verdict as boot, minus the writes: it must be able to say
+# "this box is still safe", and token scope is most of what that means. It is
+# also the only way to re-check a box that has been up for weeks — a token can
+# be re-scoped, or replaced by `gh auth login`, long after boot.
+if [ "$MODE" = audit ]; then
+  check_host_bleed || die "a host credential bridge is still in place and could not be removed."
+  check_guards
+  verify_token
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# 1. Git, in the container's own global config.
+# ---------------------------------------------------------------------------
+must git config --global init.defaultBranch main
+# There is no signing key in here; leave signing to your host.
+must git config --global commit.gpgsign false
+must git config --global tag.gpgsign false
+
+# No safe.directory entries. The container user shares your host uid, so
+# bind-mounted repos are genuinely owned by the user running git and the
+# dubious-ownership check never fires — which is better than suppressing it,
+# because the check still works if that assumption ever breaks.
+
+# If a repo's origin is an SSH URL, rewrite it to HTTPS *for this container
+# only* — there is no SSH key in here, but there is a GitHub token. A global
+# url.insteadOf rule leaves each repo's own .git/config, shared with your host
+# through the bind mount, untouched.
+git config --global --unset-all url."https://github.com/".insteadOf 2>/dev/null || true
+must git config --global --add url."https://github.com/".insteadOf "git@github.com:"
+must git config --global --add url."https://github.com/".insteadOf "ssh://git@github.com/"
+
+# ---------------------------------------------------------------------------
+# 2. Keep the host out.
+#
+#    Fatal, not advisory. The per-repo dev container could let this slide at
+#    create time because the editor's SSH proxy did not exist yet and a later
+#    postAttach --audit would catch it. Nothing here runs --audit on a schedule,
+#    so boot is the only automatic check there is: a credential bridge that
+#    survives it survives for the life of the box.
+# ---------------------------------------------------------------------------
+check_host_bleed \
+  || die "a host credential bridge is still in place and could not be removed."
+
+
+verify_token
+
+# Identity and the credential helper. These WRITE, so they are outside
+# verify_token (which --audit calls) and run only once the token has passed.
+if [ "$GH_READY" = 1 ]; then
+  name="${DEVBOX_GIT_NAME:-}"
+  email="${DEVBOX_GIT_EMAIL:-}"
+  if [ -z "$name" ] || [ -z "$email" ]; then
+    login="$(gh api user -q .login 2>/dev/null || true)"
+    uid="$(gh api user -q .id 2>/dev/null || true)"
+    if [ -n "$login" ] && [ -n "$uid" ]; then
+      name="${name:-$login}"
+      email="${email:-${uid}+${login}@users.noreply.github.com}"
+    fi
+  fi
+  if [ -n "$name" ] && [ -n "$email" ]; then
+    must git config --global user.name "$name"
+    must git config --global user.email "$email"
+  fi
+
+  gh auth setup-git >/dev/null 2>&1 \
+    || warn "devbox: gh auth setup-git failed; git push may not authenticate."
 fi
 
 # ---------------------------------------------------------------------------

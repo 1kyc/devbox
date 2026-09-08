@@ -39,10 +39,11 @@ docker compose build && docker compose up -d --force-recreate
 docker cp tests/in-container.sh devbox:/tmp/t.sh && docker compose exec devbox bash /tmp/t.sh
 docker cp tests/failclosed.sh   devbox:/tmp/f.sh && docker compose exec devbox bash /tmp/f.sh
 bash tests/worktree-roundtrip.sh
+bash tests/launcher.sh
 ```
 
-All three must be green (87 assertions). The fail-closed suite uses a fake `gh`,
-so it needs no credentials; the other two run against the real box.
+All four must be green (107 assertions). The fail-closed suite uses a fake `gh`,
+so it needs no credentials; the others run against the real box.
 
 ## Host notes
 
