@@ -224,12 +224,60 @@ github.com:
     oauth_token: github_pat_x
 EOF
 out=$(run); rc=$?
-{ [ $rc -ne 0 ] && echo "$out" | grep -q "GitHub accounts are stored"; } \
+{ [ $rc -ne 0 ] && echo "$out" | grep -q "GitHub credentials are reachable"; } \
   && ok "a second stored account is refused even when the ACTIVE token is fine" \
   || bad "second account accepted (rc=$rc): $out"
 echo "$out" | grep -q "gh auth logout -h github.com -u broad" \
   && ok "prints the exact logout command for each account" \
   || bad "no per-account logout command offered"
+
+echo "== an environment token must not shadow a stored one =="
+# gh prefers a token from the environment over anything on disk, so GH_TOKEN
+# does not REPLACE the stored credential — it hides it. `env -u GH_TOKEN gh auth
+# token` produces the stored one again, which an agent can do. Counting accounts
+# missed this: one account plus one env token is still one account.
+cat > "$GHCFG/hosts.yml" <<'EOF'
+github.com:
+    users:
+        stored:
+            oauth_token: ghp_classicSTORED
+    user: stored
+    oauth_token: ghp_classicSTORED
+EOF
+mkgh "github_pat_x" "$SCOPED"        # the env token is narrow and well scoped
+out=$( export PATH="/tmp/fakebin:$PATH" DEVBOX_PLAYGROUND="$PLAY" GH_TOKEN=github_pat_x; \
+       cd "$PLAY" && bash "$SETUP" 2>&1 ); rc=$?
+{ [ $rc -ne 0 ] && echo "$out" | grep -q "GitHub credentials are reachable"; } \
+  && ok "a narrow GH_TOKEN over a stored classic token: REFUSED" \
+  || bad "env token hid a stored token (rc=$rc): $out"
+echo "$out" | grep -q "environment/GH_TOKEN" \
+  && ok "names the environment variable as a credential source" \
+  || bad "did not list the env token"
+echo "$out" | grep -q "unset GH_TOKEN" \
+  && ok "tells you to unset it" || bad "no unset instruction"
+rm -f "$GHCFG/hosts.yml"
+
+# An env token on its own is a legitimate single credential.
+out=$( export PATH="/tmp/fakebin:$PATH" DEVBOX_PLAYGROUND="$PLAY" GH_TOKEN=github_pat_x; \
+       cd "$PLAY" && bash "$SETUP" 2>&1 ); rc=$?
+[ $rc -eq 0 ] && ok "GH_TOKEN alone, with nothing stored, is accepted" \
+  || bad "lone env token rejected (rc=$rc): $out"
+
+# GITHUB_TOKEN is the other name gh honours.
+cat > "$GHCFG/hosts.yml" <<'EOF'
+github.com:
+    users:
+        stored:
+            oauth_token: ghp_classicSTORED
+    user: stored
+    oauth_token: ghp_classicSTORED
+EOF
+out=$( export PATH="/tmp/fakebin:$PATH" DEVBOX_PLAYGROUND="$PLAY" GITHUB_TOKEN=github_pat_x; \
+       cd "$PLAY" && bash "$SETUP" 2>&1 ); rc=$?
+{ [ $rc -ne 0 ] && echo "$out" | grep -q "environment/GITHUB_TOKEN"; } \
+  && ok "GITHUB_TOKEN counts as a credential source too" \
+  || bad "GITHUB_TOKEN not counted (rc=$rc)"
+rm -f "$GHCFG/hosts.yml"
 
 # One account must still be fine, including a 2-space file.
 cat > "$GHCFG/hosts.yml" <<'EOF'

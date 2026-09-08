@@ -302,6 +302,23 @@ gh_stored_accounts() {
   ' "$hosts"
 }
 
+# Every credential an agent in this container could authenticate with, as a
+# source label.
+#
+# Not the same question as "which token will gh use". gh prefers a token from
+# the environment over anything on disk, so an env token SHADOWS a stored one
+# rather than replacing it: `env -u GH_TOKEN gh auth token` produces the stored
+# credential again, and an agent in bypass mode can do exactly that. Counting
+# accounts alone missed it, because one account with a stored token plus one
+# environment token is still one account.
+gh_credential_sources() {
+  local v
+  for v in GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN; do
+    [ -n "${!v:-}" ] && printf 'environment/%s\n' "$v"
+  done
+  gh_stored_accounts
+}
+
 verify_token() {
   STORED_TOKEN="$(gh auth token 2>/dev/null || true)"
   if [ -z "$STORED_TOKEN" ]; then
@@ -312,21 +329,21 @@ verify_token() {
   GH_AUTH_OK=0
   gh auth status >/dev/null 2>&1 && GH_AUTH_OK=1
 
-  # `gh auth token` returns the ACTIVE account's token, but gh stores one set of
-  # credentials per account and keeps the inactive ones fully usable:
-  # `gh auth token --user other` hands them over, and `gh auth switch` makes
-  # them active. Validating only the active token therefore says nothing about
-  # what an agent can actually reach — a narrow active account can sit in front
-  # of a classic token belonging to an account we never looked at.
+  # STORED_TOKEN is the one credential gh will actually use, and the scope check
+  # below measures exactly it. That is necessary but not sufficient: what makes
+  # the measurement mean anything is that there is nothing ELSE to fall back to.
   #
-  # Rather than validating each one and unioning their scopes, require a single
-  # account. The premise of this box is one identity with one auditable scope;
-  # a second set of credentials in it is the thing to remove, not to measure.
-  ACCOUNTS="$(gh_stored_accounts)"
-  ACCOUNT_COUNT="$(printf '%s\n' "$ACCOUNTS" | grep -c . || true)"
-  if [ "$ACCOUNT_COUNT" -gt 1 ] 2>/dev/null; then
+  # gh keeps every credential it holds usable, not just the selected one —
+  # `gh auth token --user other` reaches an inactive account, and dropping an
+  # environment variable reaches the token on disk underneath it. So require
+  # exactly one credential in the container, rather than validating each and
+  # unioning their scopes: the premise here is one identity with one auditable
+  # scope, and a second credential is the thing to remove, not to measure.
+  CRED_SOURCES="$(gh_credential_sources)"
+  CRED_COUNT="$(printf '%s\n' "$CRED_SOURCES" | grep -c . || true)"
+  if [ "$CRED_COUNT" -gt 1 ] 2>/dev/null; then
     TOKEN_BROAD=1
-    BROAD_REASON="${BROAD_REASON:-$ACCOUNT_COUNT GitHub accounts are stored in this container, and only the active one can be checked}"
+    BROAD_REASON="${BROAD_REASON:-$CRED_COUNT GitHub credentials are reachable in this container, and only the selected one can be checked}"
   fi
 
   case "$STORED_TOKEN" in
@@ -418,13 +435,16 @@ verify_token() {
       warn "  !! devbox: the GitHub token in this container is too broad —"
       warn "     $BROAD_REASON."
       warn ""
-      if [ "${ACCOUNT_COUNT:-0}" -gt 1 ] 2>/dev/null; then
-        warn "     Stored accounts:"
-        printf '%s\n' "$ACCOUNTS" | sed 's/^/       /' >&2
+      if [ "${CRED_COUNT:-0}" -gt 1 ] 2>/dev/null; then
+        warn "     Credentials reachable in here:"
+        printf '%s\n' "$CRED_SOURCES" | sed 's/^/       /' >&2
         warn ""
-        warn "     Any of these is one 'gh auth switch' away from being the"
-        warn "     active one, so keep exactly the account this box works as:"
-        printf '%s\n' "$ACCOUNTS" | sed 's#^\(.*\)/\(.*\)$#       gh auth logout -h \1 -u \2#' >&2
+        warn "     Each is one 'gh auth switch' or one dropped environment"
+        warn "     variable away from being the one in use. Keep exactly the"
+        warn "     credential this box works as, and remove the rest:"
+        printf '%s\n' "$CRED_SOURCES" \
+          | sed -e 's#^environment/\(.*\)$#       unset \1   (and remove it from your .env)#' \
+                -e 's#^\([^ /]*\)/\([^ ]*\)$#       gh auth logout -h \1 -u \2#' >&2
         warn ""
       fi
       if [ -n "$EXTRA_LIST" ] && [ "$EXTRA_COUNT" -gt 0 ] 2>/dev/null; then

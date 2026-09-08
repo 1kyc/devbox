@@ -149,26 +149,37 @@ unauthenticated, or `DEVBOX_ALLOW_BROAD_TOKEN=1` if you know what the token is.
 to re-check a box that has been up for weeks — a token can be re-scoped, or
 replaced by `gh auth login`, long after boot.
 
-### One account, not one active account
+### One credential, not one selected credential
 
-`gh auth token` returns the **active** account's token, but gh stores
-credentials per account and keeps the inactive ones fully usable:
-`gh auth token --user other` hands them over, and `gh auth switch` promotes
-them. So validating the active token says nothing about what an agent can
-reach — a narrow active account can sit in front of a classic token belonging
-to an account that was never examined.
+Measuring the token gh will use is necessary but not sufficient. What makes the
+measurement mean anything is that there is nothing else to fall back to — and
+gh keeps everything it holds usable, not just the selection:
 
-The box requires a **single stored account** rather than validating each one and
-unioning their scopes. Its premise is one identity with one auditable scope; a
-second set of credentials in it is the thing to remove, not to measure. That is
-also the concrete risk for a personal box: the account you did not mean to bring
-in is usually the work one.
+- **Inactive accounts.** `gh auth token` returns the *active* account's token,
+  but `gh auth token --user other` reaches an inactive one and `gh auth switch`
+  promotes it. A narrow active account can sit in front of a classic token
+  belonging to an account never examined.
+- **Environment tokens.** gh prefers `GH_TOKEN`/`GITHUB_TOKEN` over anything on
+  disk, so an env token does not *replace* a stored credential, it **hides** it:
+  `env -u GH_TOKEN gh auth token` produces the stored one again, and an agent in
+  bypass mode can do exactly that. Counting accounts missed this — one account
+  plus one env token is still one account.
 
-Accounts are enumerated from `hosts.yml` rather than `gh auth status`, because
-enumeration has to work with no network — the same reason the check keys off a
-stored token in the first place. The API calls then pin `GH_TOKEN` to the exact
-token that was classified, so a switch between "which token is this" and "what
-does it reach" cannot judge one token by another's scope.
+So the check counts **credential sources**, not accounts, and requires exactly
+one. Validating each and unioning their scopes would measure the problem; the
+premise here is one identity with one auditable scope, and a second credential
+is the thing to remove. That is also the concrete risk for a personal box: the
+account you did not mean to bring in is usually the work one.
+
+Sources are enumerated from `hosts.yml` and the environment rather than from
+`gh auth status`, because enumeration has to work with no network — the same
+reason the check keys off a stored token in the first place. The API calls then
+pin `GH_TOKEN` to the exact token that was classified, so "which token is this"
+and "what does it reach" cannot disagree.
+
+The general shape, since three separate findings landed on it: **an agent can
+drop any environment variable and select any stored credential.** Anything that
+looks like configuration is a preference, not a boundary.
 
 ### Report what happened, not what was attempted
 
