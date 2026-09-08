@@ -95,6 +95,13 @@ is the honest version of it.
 `devbox audit` re-runs the same verification against a box that is already up,
 which is how you re-check after re-scoping a token or running `gh auth login`.
 
+**What this covers.** The four `GH_*`/`GITHUB_*` token variables, `hosts.yml` in
+every directory gh might use (`GH_CONFIG_DIR`, `XDG_CONFIG_HOME/gh`,
+`~/.config/gh`), and anything `gh auth token` will hand over. It cannot prove no
+credential exists anywhere an agent can read — a token pasted into a file in the
+playground is outside its reach. It is a guardrail against credential sprawl in
+the paths gh itself uses, not a proof of absence.
+
 Override with `DEVBOX_ALLOW_BROAD_TOKEN=1` in `.env` if you mean it.
 
 ## What is actually enforced
@@ -182,7 +189,7 @@ bash tests/worktree-roundtrip.sh
 bash tests/launcher.sh
 ```
 
-126 assertions: the box's invariants, the scope check's refusals (with a fake
+127 assertions: the box's invariants, the scope check's refusals (with a fake
 `gh`), and the worktree round-trip.
 
 ## Troubleshooting

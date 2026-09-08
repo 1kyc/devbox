@@ -177,9 +177,29 @@ reason the check keys off a stored token in the first place. The API calls then
 pin `GH_TOKEN` to the exact token that was classified, so "which token is this"
 and "what does it reach" cannot disagree.
 
-The general shape, since three separate findings landed on it: **an agent can
-drop any environment variable and select any stored credential.** Anything that
-looks like configuration is a preference, not a boundary.
+The general shape, since several separate findings landed on it: **an agent can
+drop any environment variable, select any stored credential, name any host, and
+point any config-path override somewhere empty.** Anything that looks like
+configuration is a preference, not a boundary.
+
+### What the credential check does and does not cover
+
+It is worth being exact, because "one auditable credential" sounds like a proof
+and is not one. The check looks at:
+
+- `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`
+- `hosts.yml` in **every** directory gh might use — `GH_CONFIG_DIR`,
+  `XDG_CONFIG_HOME/gh`, and `~/.config/gh` — not just the selected one
+- whatever `gh auth token` will hand over, even when nothing above explains it
+
+It cannot prove that no credential exists anywhere an agent can read. A token
+pasted into a file in the playground, baked into a repo's `.git/config`, or held
+by some other tool is outside its reach entirely. It is a **guardrail against
+credential sprawl in the paths gh itself uses**, not a proof of absence — which
+is the same honesty the pre-push hook and the merge shim get in the README.
+
+What is actually *enforced* remains the mount and the container: nothing outside
+the playground exists to an agent, and there is no root.
 
 ### Report what happened, not what was attempted
 

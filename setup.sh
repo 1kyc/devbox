@@ -285,8 +285,43 @@ BROAD_REASON=""
 # Read from hosts.yml rather than `gh auth status`, because this has to work
 # with no network — the whole point of the check above is that a stored token
 # outlives a failed status call.
+
+# Every directory gh might keep credentials in, most-preferred first.
+#
+# GH_CONFIG_DIR wins over XDG_CONFIG_HOME/gh, which wins over ~/.config/gh. That
+# ordering is the hazard, not a detail: pointing GH_CONFIG_DIR at an empty
+# directory makes `gh auth token` return nothing AND makes a store-of-one check
+# find nothing, so the two agree that there are no credentials while the default
+# store still holds a token an agent reaches by dropping the variable. Look in
+# all of them.
+gh_config_dirs() {
+  local d seen=":"
+  for d in "${GH_CONFIG_DIR:-}" "${XDG_CONFIG_HOME:+$XDG_CONFIG_HOME/gh}" "$HOME/.config/gh"; do
+    [ -n "$d" ] || continue
+    d="$(cd "$d" 2>/dev/null && pwd -P || printf '%s' "$d")"
+    case "$seen" in *":$d:"*) continue ;; esac
+    seen="$seen$d:"
+    printf '%s\n' "$d"
+  done
+}
+
 gh_stored_accounts() {
-  local hosts="${GH_CONFIG_DIR:-$HOME/.config/gh}/hosts.yml"
+  local dir selected=1
+  while IFS= read -r dir; do
+    # The first directory is the one gh will actually use. Accounts in any other
+    # store are labelled with it, so two stores holding the same account name
+    # count as the two separate credentials they are.
+    if [ "$selected" = 1 ]; then
+      gh_accounts_in "$dir"
+    else
+      gh_accounts_in "$dir" | sed "s#\$# @$dir#"
+    fi
+    selected=0
+  done < <(gh_config_dirs)
+}
+
+gh_accounts_in() {
+  local hosts="$1/hosts.yml"
   [ -f "$hosts" ] || return 0
   # Accounts are the keys one level inside a host's `users:` block. The first
   # key encountered fixes the indent, so 2- and 4-space files both parse.
@@ -474,13 +509,16 @@ verify_token() {
         warn "     Credentials reachable in here:"
         printf '%s\n' "$CRED_SOURCES" | sed 's/^/       /' >&2
         warn ""
-      fi
-      if [ "${CRED_COUNT:-0}" -gt 1 ] 2>/dev/null; then
-        warn "     Each is one 'gh auth switch' or one dropped environment"
-        warn "     variable away from being the one in use. Keep exactly the"
-        warn "     credential this box works as, and remove the rest:"
+        if [ "${CRED_COUNT:-0}" -gt 1 ] 2>/dev/null; then
+          warn "     Each is one 'gh auth switch', one dropped environment"
+          warn "     variable or one config path away from being the one in"
+          warn "     use. Keep the credential this box works as, drop the rest:"
+        else
+          warn "     To remove it:"
+        fi
         printf '%s\n' "$CRED_SOURCES" \
           | sed -e 's#^environment/\(.*\)$#       unset \1   (and remove it from your .env)#' \
+                -e 's#^\([^ /]*\)/\([^ ]*\) @\(.*\)$#       GH_CONFIG_DIR=\3 gh auth logout -h \1 -u \2#' \
                 -e 's#^\([^ /]*\)/\([^ ]*\)$#       gh auth logout -h \1 -u \2#' >&2
         warn ""
       fi

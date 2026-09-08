@@ -14,7 +14,31 @@ ok()  { pass=$((pass+1)); echo "  ok   - $1"; }
 bad() { fail=$((fail+1)); echo "  FAIL - $1"; }
 
 SETUP=/usr/local/share/devbox/setup.sh
-PLAY=/tmp/play
+
+# This suite writes credential files, Docker configs and shell rc files, and the
+# documented way to run it is against the LIVE box — which holds your real
+# GitHub login. So it must never touch the real ones.
+#
+# It used to. An earlier version saved and restored ~/.config/gh/hosts.yml, and
+# then a later test added below the restore deleted it again: one run destroyed
+# a real login, and the second run went green precisely BECAUSE the credential
+# was gone. Backing up and restoring is not enough; the suite has to work
+# somewhere else entirely.
+REAL_GH="${GH_CONFIG_DIR:-$HOME/.config/gh}"
+real_fingerprint() { ( cd "$REAL_GH" 2>/dev/null && md5sum ./* 2>/dev/null ) | md5sum; }
+REAL_BEFORE="$(real_fingerprint)"
+
+SANDBOX="$(mktemp -d)"
+cleanup() { chmod -R u+w "$SANDBOX" 2>/dev/null; rm -rf "$SANDBOX" /tmp/fakebin; }
+trap cleanup EXIT
+
+export HOME="$SANDBOX/home"
+export GH_CONFIG_DIR="$HOME/.config/gh"
+export CLAUDE_CONFIG_DIR="$HOME/.claude"
+export CODEX_HOME="$HOME/.codex"
+PLAY="$SANDBOX/play"
+GHCFG="$GH_CONFIG_DIR"
+mkdir -p "$GHCFG" "$CLAUDE_CONFIG_DIR" "$CODEX_HOME" "$PLAY"
 
 # A playground containing the named repos (owner/name), plus one local-only repo
 # that is not on GitHub at all.
@@ -208,8 +232,6 @@ echo "== only one GitHub account may be stored =="
 # accounts fully usable: `gh auth token --user other` hands them over and
 # `gh auth switch` promotes them. A narrow active account in front of a classic
 # one used to pass, because only the active token was ever examined.
-GHCFG="$HOME/.config/gh"; mkdir -p "$GHCFG"
-[ -f "$GHCFG/hosts.yml" ] && cp "$GHCFG/hosts.yml" /tmp/hosts.bak
 mkplay tester/alpha tester/beta
 mkgh "github_pat_x" "$SCOPED"        # the ACTIVE token is perfectly scoped
 cat > "$GHCFG/hosts.yml" <<'EOF'
@@ -293,7 +315,6 @@ out=$(run); rc=$?
 [ $rc -eq 0 ] && ok "a single account parses and passes (2-space indent)" \
   || bad "single account rejected (rc=$rc): $out"
 rm -f "$GHCFG/hosts.yml"
-[ -f /tmp/hosts.bak ] && mv /tmp/hosts.bak "$GHCFG/hosts.yml"
 
 echo "== a credential for another host is not mistaken for no credential =="
 # `gh auth token` resolves github.com. A credential gh holds for a different
@@ -345,6 +366,58 @@ out=$(run); rc=$?
   && ok "a token with no enumerable source is still checked" \
   || bad "unattributed token was ignored (rc=$rc): $out"
 
+echo "== GH_CONFIG_DIR must not hide the default store =="
+# gh prefers GH_CONFIG_DIR over ~/.config/gh, so pointing it at an empty
+# directory made `gh auth token` return nothing AND made a store-of-one check
+# find nothing — the two agreed there were no credentials while the default
+# store still held a token, one dropped variable away.
+mkplay tester/alpha tester/beta
+mkdir -p "$HOME/.config/gh" "$SANDBOX/emptycfg"
+cat > "$HOME/.config/gh/hosts.yml" <<'EOF'
+github.com:
+    users:
+        hidden:
+            oauth_token: ghp_classicHIDDEN
+    user: hidden
+    oauth_token: ghp_classicHIDDEN
+EOF
+cat > /tmp/fakebin/gh <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+  "auth token")  exit 1 ;;      # the override points somewhere empty
+  "auth status") exit 1 ;;
+esac
+exit 1
+EOF
+chmod +x /tmp/fakebin/gh
+out=$( export PATH="/tmp/fakebin:$PATH" DEVBOX_PLAYGROUND="$PLAY" GH_CONFIG_DIR="$SANDBOX/emptycfg"; \
+       cd "$PLAY" && bash "$SETUP" 2>&1 ); rc=$?
+{ [ $rc -ne 0 ] && echo "$out" | grep -q "github.com/hidden"; } \
+  && ok "a store hidden behind GH_CONFIG_DIR is still found" \
+  || bad "default store hidden by GH_CONFIG_DIR (rc=$rc): $out"
+echo "$out" | grep -q "GH_CONFIG_DIR=.* gh auth logout -h github.com -u hidden" \
+  && ok "the logout command names the store it lives in" \
+  || bad "no store-qualified logout command: $out"
+
+# XDG_CONFIG_HOME is the other way the default location moves.
+rm -f "$HOME/.config/gh/hosts.yml"
+mkdir -p "$SANDBOX/xdg/gh"
+cat > "$SANDBOX/xdg/gh/hosts.yml" <<'EOF'
+github.com:
+    users:
+        xdguser:
+            oauth_token: ghp_classicXDG
+    user: xdguser
+    oauth_token: ghp_classicXDG
+EOF
+out=$( export PATH="/tmp/fakebin:$PATH" DEVBOX_PLAYGROUND="$PLAY" \
+              GH_CONFIG_DIR="$SANDBOX/emptycfg" XDG_CONFIG_HOME="$SANDBOX/xdg"; \
+       cd "$PLAY" && bash "$SETUP" 2>&1 ); rc=$?
+{ [ $rc -ne 0 ] && echo "$out" | grep -q "github.com/xdguser"; } \
+  && ok "an XDG_CONFIG_HOME store is found too" \
+  || bad "XDG store missed (rc=$rc): $out"
+rm -rf "$SANDBOX/xdg" "$SANDBOX/emptycfg"
+
 echo "== undeletable Docker credentials are fatal, not announced as deleted =="
 # The message used to claim deletion regardless of whether rm worked.
 rm -rf "$HOME/.docker"; mkdir -p "$HOME/.docker"
@@ -384,7 +457,7 @@ echo "== an unremovable credential bridge is fatal at STARTUP =="
 #
 # Simulated with a live agent socket in a directory we can read but not write,
 # which is exactly the "detected but unremovable" shape.
-LOCK=/tmp/lockdir
+LOCK="$SANDBOX/lockdir"
 rm -rf "$LOCK"; mkdir -p "$LOCK"
 perl -MIO::Socket::UNIX -e \
   'IO::Socket::UNIX->new(Local=>q('"$LOCK"'/vscode-ssh-auth-x.sock), Listen=>1) or die; sleep 60' &
@@ -407,7 +480,7 @@ chmod 700 "$LOCK" 2>/dev/null; rm -rf "$LOCK"
 
 echo "== a socket it CAN remove is removed, and startup continues =="
 mkgh "github_pat_x" "$SCOPED"
-FREE=/tmp/freedir; rm -rf "$FREE"; mkdir -p "$FREE"
+FREE="$SANDBOX/freedir"; rm -rf "$FREE"; mkdir -p "$FREE"
 perl -MIO::Socket::UNIX -e \
   'IO::Socket::UNIX->new(Local=>q('"$FREE"'/vscode-ssh-auth-y.sock), Listen=>1) or die; sleep 60' &
 sockpid=$!
@@ -460,7 +533,14 @@ out=$(run); rc=$?
   && ok "an unparseable answer is a stop, not an empty scope" \
   || bad "malformed json was treated as narrow (rc=$rc): $out"
 
-rm -rf /tmp/fakebin "$PLAY"
+
+echo "== the suite left the real credential store alone =="
+# The check on the checker. A green run that quietly deleted your GitHub login
+# is worse than a red one, and the second run would go green *because* of it.
+[ "$(real_fingerprint)" = "$REAL_BEFORE" ] \
+  && ok "$REAL_GH is byte-identical to before the run" \
+  || bad "THE SUITE MODIFIED $REAL_GH — real credentials may have been destroyed"
+
 echo
 echo "passed=$pass failed=$fail"
 [ "$fail" -eq 0 ]
