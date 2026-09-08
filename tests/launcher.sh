@@ -14,6 +14,8 @@ bad() { fail=$((fail+1)); echo "  FAIL - $1"; }
 
 REPO="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 DEVBOX="$REPO/bin/devbox"
+SANDBOX_LINK="$(mktemp -d)/devbox"
+trap 'rm -rf "$(dirname "$SANDBOX_LINK")"' EXIT
 
 # Every subcommand must at least dispatch. Anything printing "exec:" or
 # "command not found" failed before it reached docker.
@@ -24,6 +26,44 @@ dispatches() { # <name> <output>
     *) ok "$1 dispatches" ;;
   esac
 }
+
+echo "== every script is executable, in git and on disk =="
+# This suite ran `bash "$DEVBOX"` everywhere, which works on a file with no
+# exec bit — so it passed 10/10 while `./bin/devbox` and the documented
+# ~/.local/bin/devbox symlink were both Permission denied.
+#
+# Four files lost the bit at once, because editing them through a Windows UNC
+# path rewrites the mode. Three went unnoticed because the Dockerfile COPYs
+# them with --chmod=0755, so the image was correct while the repo was not.
+# Assert the mode in git's index, which is what a fresh clone gets.
+cd "$REPO"
+for f in $(git ls-files); do
+  case "$f" in
+    *.sh|bin/devbox|guards/bin/*|guards/hooks/*) ;;
+    *) continue ;;
+  esac
+  mode="$(git ls-files -s "$f" | cut -d' ' -f1)"
+  [ "$mode" = 100755 ] \
+    && ok "$f is 100755 in the index" \
+    || bad "$f is $mode in the index — a fresh clone cannot execute it"
+  [ -x "$f" ] || bad "$f is not executable on disk"
+done
+
+echo "== the launcher runs directly, not just under bash =="
+# The form the README documents (a symlink on PATH) and the form the old tests
+# never used.
+out="$("$DEVBOX" status 2>&1)"; rc=$?
+{ [ $rc -eq 0 ] && ! printf '%s' "$out" | grep -qi "permission denied"; } \
+  && ok "./bin/devbox executes without an interpreter" \
+  || bad "direct invocation failed (rc=$rc): $out"
+
+ln -sf "$DEVBOX" "$SANDBOX_LINK" 2>/dev/null || true
+if [ -L "$SANDBOX_LINK" ]; then
+  out="$("$SANDBOX_LINK" status 2>&1)"; rc=$?
+  [ $rc -eq 0 ] && ok "a PATH symlink to it works (the documented setup)" \
+    || bad "symlink invocation failed (rc=$rc): $out"
+  rm -f "$SANDBOX_LINK"
+fi
 
 echo "== dispatch =="
 for c in status logs; do
