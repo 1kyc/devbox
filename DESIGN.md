@@ -198,6 +198,35 @@ by some other tool is outside its reach entirely. It is a **guardrail against
 credential sprawl in the paths gh itself uses**, not a proof of absence — which
 is the same honesty the pre-push hook and the merge shim get in the README.
 
+Three of those paths are also closed **structurally** rather than only checked:
+`compose.yaml` pins the four token variables empty and `GH_CONFIG_DIR` at the gh
+volume, so at boot an env token or a redirected store can only come from a file
+this repo owns. The runtime check stays, because an agent can re-export anything.
+
+### Parsed nothing is not nothing
+
+`gh_accounts_in` returns a tri-state — absent, parsed-N, **present but
+unparsed** — and the third feeds the same "unverifiable" branch as an
+unreadable API answer.
+
+The rule was already in this file, applied to GitHub's responses ("a `jq`
+failure means the answer is unparseable, not that the token is narrow") and not
+to the parser we wrote ourselves, which is the more fragile of the two. gh's
+older single-account `hosts.yml` has no `users:` block; the awk found zero
+accounts, zero accounts read as "no credentials", and a classic token sat there
+invisible. Same hole as the config-dir round, reached through the parser instead
+of the path.
+
+### The summary reports what was observed
+
+`check_guards` records whether the hook and the shim are actually wired up, and
+the summary prints that — not the configuration that was supposed to produce it.
+It previously read `DEVBOX_PROTECTED_BRANCHES` and `DEVBOX_ALLOW_MERGE` straight
+from the environment, so it could print `protected <none>` while the guard's own
+default was protecting `main master`, and `push blocked` forty lines after
+warning that the hook was inactive. A summary that contradicts a warning in the
+same run is the "check that lies" failure at its most visible.
+
 What is actually *enforced* remains the mount and the container: nothing outside
 the playground exists to an agent, and there is no root.
 

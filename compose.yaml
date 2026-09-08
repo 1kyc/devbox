@@ -78,6 +78,23 @@ services:
       # Nothing in here should ever reach an ssh-agent.
       SSH_AUTH_SOCK: ""
 
+      # Pin the credential environment rather than leaving it to be inherited.
+      #
+      # setup.sh checks all of these at boot, but a check is a backstop and this
+      # is the boundary: at boot, the only way an env token or a redirected
+      # config dir exists is that it came from here or from .env — files this
+      # repo owns. Nailing them down makes three of the credential-shadowing
+      # cases structurally unreachable rather than merely detected, which is the
+      # same treatment SSH_AUTH_SOCK gets one line up.
+      #
+      # An agent can still re-export any of them at runtime; that is what the
+      # boot check is for, and why it stays.
+      GH_TOKEN: ""
+      GITHUB_TOKEN: ""
+      GH_ENTERPRISE_TOKEN: ""
+      GITHUB_ENTERPRISE_TOKEN: ""
+      GH_CONFIG_DIR: /home/${DEVBOX_USER:-kyc}/.config/gh
+
     # No root, no capabilities, no way to acquire either. This is what makes
     # "the container is the sandbox" a real claim rather than a hopeful one:
     # a compromised agent cannot install packages, load modules, or escalate.

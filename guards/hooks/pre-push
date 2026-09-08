@@ -30,8 +30,11 @@ if [ -n "$protected" ]; then
       refs/heads/*) branch="${remote_ref#refs/heads/}" ;;
       *) continue ;;
     esac
-    for p in $protected; do
-      [ "$branch" = "$p" ] || continue
+    # A glob over the space-padded list, rather than a loop with an inverted
+    # guard: same word-boundary semantics, one level of nesting less, and it
+    # reads as "if this branch is in the list" instead of "skip unless equal".
+    case " $protected " in
+      *" $branch "*)
       cat >&2 <<MSG
 
   x devbox: refusing to push to '$branch' on '$remote_name'.
@@ -43,8 +46,9 @@ if [ -n "$protected" ]; then
         gh pr create --base $branch --fill
 
 MSG
-      exit 1
-    done
+        exit 1
+        ;;
+    esac
   done <<< "$input"
 fi
 

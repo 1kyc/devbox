@@ -34,24 +34,33 @@ fi
 
 # The box is only useful when it is up; shelling into a stopped box should start
 # it rather than erroring at you.
+#
+# A label query, not `compose ps` + `docker inspect`. Both of those serialize an
+# existing container's full inspect payload and measure ~3 s EACH on Docker
+# Desktop, so the old pair cost 6.1 s in front of every interactive command —
+# far more than everything setup.sh does at boot. This is 31 ms. Filtering on
+# the compose labels rather than the container name also stays correct when
+# DEVBOX_NAME is set.
 ensure_up() {
-  local id
-  id="$(docker compose ps -q devbox 2>/dev/null)"
-  if [ -z "$id" ] \
-     || [ "$(docker inspect -f '{{.State.Running}}' "$id" 2>/dev/null)" != true ]; then
-    docker compose up -d
-  fi
+  [ -n "$(docker container ls -q \
+            -f label=com.docker.compose.project="${PWD##*/}" \
+            -f label=com.docker.compose.service=devbox \
+            -f status=running 2>/dev/null)" ] || docker compose up -d
 }
+
+# `exec docker compose` stays spelled out inside the function, so this cannot
+# regress into the `exec dc` mistake above.
+in_box() { ensure_up; exec docker compose exec devbox "$@"; }
 
 cmd="${1:-shell}"
 [ $# -gt 0 ] && shift
 
 case "$cmd" in
-  shell|sh) ensure_up; exec docker compose exec devbox bash -l ;;
-  cc)       ensure_up; exec docker compose exec devbox bash -lc 'claude --dangerously-skip-permissions "$@"' _ "$@" ;;
-  cx)       ensure_up; exec docker compose exec devbox bash -lc 'codex --dangerously-bypass-approvals-and-sandbox "$@"' _ "$@" ;;
-  run)      ensure_up; exec docker compose exec devbox bash -lc "$*" ;;
-  audit)    ensure_up; exec docker compose exec devbox /usr/local/share/devbox/setup.sh --audit ;;
+  shell|sh) in_box bash -l ;;
+  cc)       in_box bash -lc 'claude --dangerously-skip-permissions "$@"' _ "$@" ;;
+  cx)       in_box bash -lc 'codex --dangerously-bypass-approvals-and-sandbox "$@"' _ "$@" ;;
+  run)      in_box bash -lc "$*" ;;
+  audit)    in_box /usr/local/share/devbox/setup.sh --audit ;;
   up)       exec docker compose up -d "$@" ;;
   down)     exec docker compose down "$@" ;;
   logs)     exec docker compose logs "$@" devbox ;;

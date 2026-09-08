@@ -25,13 +25,30 @@ case "${1:-}" in
   --quiet) MODE=quiet ;;
   --audit) MODE=audit ;;
 esac
-QUIET=0
-[ "$MODE" = full ] || QUIET=1
-
-say()  { [ "$QUIET" = 1 ] || printf '%s\n' "$*"; }
+say()  { [ "$MODE" = full ] && printf '%s\n' "$*"; }
 warn() { printf '%s\n' "$*" >&2; }
 die()  { warn ""; warn "  xx devbox: $*"; warn ""; exit 1; }
 must() { "$@" || die "required setup step failed: $*"; }
+
+# Count the non-empty lines of a newline-separated list. `grep -c` exits 1 on
+# no match, which is a legitimate answer of zero, so absorb it here once rather
+# than at every call site.
+nlines()   { grep -c . <<<"$1" || true; }
+# Indent a list under a warning.
+warn_list() { sed 's/^/       /' <<<"$1" >&2; }
+# The lines of $1 that are not in $2.
+not_in()   { grep -vxF -f <(printf '%s\n' "$2") <<<"$1" || true; }
+# Remove a file and PROVE it is gone. Every credential removal goes through
+# this: announcing a deletion that silently failed is worse than not checking,
+# so "did it work" is answered in one place instead of at each removal.
+gone()     { rm -f "$1" 2>/dev/null && [ ! -e "$1" ]; }
+
+# Record a reason this box will not run agents against the credentials it found.
+# A LIST, not a first-wins scalar: several can be true at once (a classic token
+# AND a second credential behind it), and the override needs to name every one
+# of them — it used to print a hand-written summary that could describe a
+# different problem than the one that actually stopped the box.
+broad() { BROAD_REASONS="${BROAD_REASONS:+$BROAD_REASONS$'\n'}$1"; }
 
 # The one folder this box can see. Everything outside it is unreachable, which
 # is the whole security model.
@@ -63,22 +80,25 @@ check_host_bleed() {
   # Nothing in here uses Docker, so copied registry credentials are pure risk.
   # This file is in the container's own filesystem; deleting it touches nothing
   # on your host.
-  if [ -s "$HOME/.docker/config.json" ] \
-     && grep -q '"auths"' "$HOME/.docker/config.json" 2>/dev/null; then
+  #
+  # All three shapes, not just "auths": `credsStore` and `credHelpers` are what
+  # VS Code's dev.containers.dockerCredentialHelper actually writes — that is,
+  # the exact channel this check names in its own advice — and matching only
+  # "auths" walked straight past them.
+  local dockercfg="$HOME/.docker/config.json"
+  if [ -s "$dockercfg" ] \
+     && grep -qE '"(auths|credsStore|credHelpers)"' "$dockercfg" 2>/dev/null; then
     leaks=1
     warn ""
-    # Say what happened, not what was attempted. Announcing a deletion that
-    # silently failed is worse than not checking at all.
-    if rm -f "$HOME/.docker/config.json" 2>/dev/null \
-       && [ ! -e "$HOME/.docker/config.json" ]; then
+    if gone "$dockercfg"; then
       warn "  !! devbox: deleted host Docker registry credentials that something"
       warn "     copied in. If this was VS Code, set"
       warn "     \"dev.containers.dockerCredentialHelper\": false."
     else
       unfixed=1
       warn "  !! devbox: COULD NOT REMOVE host Docker registry credentials at"
-      warn "     $HOME/.docker/config.json — they are readable by anything in"
-      warn "     this container. Check the permissions on $HOME/.docker."
+      warn "     $dockercfg — they are readable by anything in this container."
+      warn "     Check the permissions on $HOME/.docker."
     fi
   fi
 
@@ -103,7 +123,7 @@ check_host_bleed() {
     leaks=1
     warn ""
     warn "  !! devbox: a git credential helper other than gh's was configured:"
-    printf '%s\n' "$foreign" | sed 's/^/       /' >&2
+    warn_list "$foreign"
 
     git config --global --unset-all credential.helper 2>/dev/null || true
     local key
@@ -118,7 +138,7 @@ check_host_bleed() {
     if [ -n "$foreign" ]; then
       unfixed=1
       warn "     COULD NOT REMOVE these (they live outside the config we own):"
-      printf '%s\n' "$foreign" | sed 's/^/       /' >&2
+      warn_list "$foreign"
     else
       warn "     Removed from this container's git config."
     fi
@@ -134,7 +154,7 @@ check_host_bleed() {
     warn ""
     warn "  !! devbox: an SSH agent is forwarded into this container."
     for sock in $socks; do
-      if rm -f "$sock" 2>/dev/null && [ ! -e "$sock" ]; then
+      if gone "$sock"; then
         warn "     Removed $sock (it returns on the next attach)."
       else
         unfixed=1
@@ -154,7 +174,7 @@ check_host_bleed() {
     warn ""
     warn "  !! devbox: SSH_AUTH_SOCK is set to $SSH_AUTH_SOCK"
     if [ -S "$SSH_AUTH_SOCK" ]; then
-      if rm -f "$SSH_AUTH_SOCK" 2>/dev/null && [ ! -e "$SSH_AUTH_SOCK" ]; then
+      if gone "$SSH_AUTH_SOCK"; then
         warn "     It was a live agent socket. Removed."
       else
         unfixed=1
@@ -186,8 +206,9 @@ check_guards() {
   local hooks
   hooks="$(cd "$PLAYGROUND" 2>/dev/null && git rev-parse --git-path hooks 2>/dev/null || true)"
   case "${hooks:-/usr/local/share/devbox/hooks}" in
-    /usr/local/share/devbox/hooks*) : ;;
+    /usr/local/share/devbox/hooks*) HOOKS_ACTIVE=1 ;;
     *)
+      HOOKS_ACTIVE=0
       warn ""
       warn "  !! devbox: the pre-push guard is NOT active."
       warn "     git resolves hooks to: $hooks"
@@ -216,11 +237,14 @@ check_guards() {
   esac
 
   # The `gh` on PATH must be the shim, not the real thing.
-  case "$(command -v gh 2>/dev/null || true)" in
-    /usr/local/share/devbox/bin/gh) : ;;
+  local gh_path
+  gh_path="$(command -v gh 2>/dev/null || true)"
+  case "$gh_path" in
+    /usr/local/share/devbox/bin/gh) SHIM_ACTIVE=1 ;;
     *)
+      SHIM_ACTIVE=0
       warn ""
-      warn "  !! devbox: 'gh' resolves to $(command -v gh 2>/dev/null || echo '<nothing>'),"
+      warn "  !! devbox: 'gh' resolves to ${gh_path:-<nothing>},"
       warn "     not the merge guard at /usr/local/share/devbox/bin/gh."
       warn "     PR merges are unguarded in this shell."
       warn ""
@@ -244,14 +268,24 @@ check_guards() {
 # Repositories present in the playground, as owner/name. Worktrees resolve to
 # the same origin as their main checkout, so they dedupe away for free.
 # `-print -prune` stops find descending into .git itself.
+#
+# The dependency directories are pruned by name, not merely bounded by depth.
+# `-maxdepth` still descends INTO node_modules to look for a `.git` at the next
+# level, so a 50-repo playground walked 18k inodes to find 50 — 28 ms of the
+# scan against 1 ms pruned. They cannot contain a repo we care about anyway.
+#
+# `git remote get-url` stays a fork per repo (~0.8 ms): reading .git/config
+# directly would be faster and would break worktrees, where .git is a file.
 present_repos() {
-  find "$PLAYGROUND" -maxdepth "$SCAN_DEPTH" -name .git -print -prune 2>/dev/null \
+  find "$PLAYGROUND" -maxdepth "$SCAN_DEPTH" \
+       \( -name node_modules -o -name .venv -o -name vendor -o -name target \) -prune -o \
+       -name .git -print -prune 2>/dev/null \
   | while IFS= read -r g; do
-      url="$(git -C "$(dirname "$g")" remote get-url origin 2>/dev/null || true)"
-      [ -n "$url" ] || continue
-      printf '%s\n' "$url" \
-        | sed -E 's#^(https?://[^/]+/|git@[^:]+:|ssh://[^/]+/)##; s#\.git$##'
-    done | sort -u
+      # ${g%/.git} rather than $(dirname): a builtin, not a fork per repo.
+      git -C "${g%/.git}" remote get-url origin 2>/dev/null || true
+    done \
+  | sed -E 's#^(https?://[^/]+/|git@[^:]+:|ssh://[^/]+/)##; s#\.git$##' \
+  | sort -u
 }
 
 GH_READY=0
@@ -263,8 +297,7 @@ TOKEN_COUNT=0
 EXTRA_LIST=""
 EXTRA_COUNT=0
 NOPUSH_LIST=""
-TOKEN_BROAD=0
-BROAD_REASON=""
+BROAD_REASONS=""
 
 # Verification only — it writes nothing, so --audit can call it too. Dies if the
 # token is not one this box is willing to run agents against.
@@ -321,8 +354,38 @@ gh_stored_accounts() {
 }
 
 gh_accounts_in() {
-  local hosts="$1/hosts.yml"
+  local hosts="$1/hosts.yml" found
   [ -f "$hosts" ] || return 0
+
+  # A store that exists but yields NOTHING is not an empty store — it is a store
+  # this parser did not understand, and the difference is a credential.
+  #
+  # gh's older single-account format has no `users:` block at all:
+  #
+  #     github.com:
+  #         oauth_token: ghp_...
+  #         user: someone
+  #
+  # gh still reads it; this awk sees zero accounts. Reported as "no accounts"
+  # it becomes "not logged in", and a classic token sits there unexamined —
+  # which is the config-dir hole again through a different door. The rule this
+  # file already applies to GitHub's API answers ("unparseable is not narrow")
+  # applies with more force to a parser we wrote ourselves.
+  found="$(gh_parse_users "$hosts")"
+  if [ -z "$found" ] && grep -qE '^[ \t]*(oauth_token|user):' "$hosts"; then
+    printf '%s/?unparsed\n' "$(gh_first_host "$hosts")"
+    return 0
+  fi
+  printf '%s' "${found:+$found$'\n'}"
+}
+
+# The first host key in a hosts.yml, for labelling a store we could not parse.
+gh_first_host() {
+  awk '/^[^ \t#]/ && /:[ \t]*$/ { sub(/:[ \t]*$/, ""); print; exit }' "$1"
+}
+
+gh_parse_users() {
+  local hosts="$1"
   # Accounts are the keys one level inside a host's `users:` block. The first
   # key encountered fixes the indent, so 2- and 4-space files both parse.
   awk '
@@ -383,7 +446,7 @@ verify_token() {
   if [ -n "$STORED_TOKEN" ] && [ -z "$CRED_SOURCES" ]; then
     CRED_SOURCES="gh/selected"
   fi
-  CRED_COUNT="$(printf '%s\n' "$CRED_SOURCES" | grep -c . || true)"
+  CRED_COUNT="$(nlines "$CRED_SOURCES")"
 
   # Zero now means zero both ways: nothing enumerable, and nothing gh will give
   # us. That is the only safe reason to skip the rest of this function.
@@ -393,11 +456,8 @@ verify_token() {
   fi
 
   GH_READY=1
-  GH_AUTH_OK=0
-  gh auth status >/dev/null 2>&1 && GH_AUTH_OK=1
   if [ "$CRED_COUNT" -gt 1 ] 2>/dev/null; then
-    TOKEN_BROAD=1
-    BROAD_REASON="${BROAD_REASON:-$CRED_COUNT GitHub credentials are reachable in this container, and only the selected one can be checked}"
+    broad "$CRED_COUNT GitHub credentials are reachable in this container, and only the selected one can be checked"
   fi
 
   case "$STORED_TOKEN" in
@@ -411,19 +471,16 @@ verify_token() {
     # credential is reachable" is the more fundamental fact, and the token kind
     # is visible in the summary line either way.
     "")           TOKEN_KIND="unverifiable"
-                  TOKEN_BROAD=1
-                  BROAD_REASON="${BROAD_REASON:-a credential is present that this box cannot verify: devbox checks github.com credentials only, and gh returns nothing for github.com}" ;;
+                  broad "a credential is present that this box cannot verify: devbox checks github.com credentials only, and gh returns nothing for github.com" ;;
     github_pat_*) TOKEN_KIND="fine-grained" ;;
     gho_*)        TOKEN_KIND="oauth"
-                  TOKEN_BROAD=1
-                  BROAD_REASON="${BROAD_REASON:-it is an OAuth token from a browser login, which carries your whole account access}" ;;
+                  broad "it is an OAuth token from a browser login, which carries your whole account access" ;;
     *)            TOKEN_KIND="classic"
-                  TOKEN_BROAD=1
-                  BROAD_REASON="${BROAD_REASON:-it is a classic token, which reaches every repo on your account}" ;;
+                  broad "it is a classic token, which reaches every repo on your account" ;;
   esac
 
   PRESENT_REPOS="$(present_repos)"
-  PRESENT_COUNT="$(printf '%s\n' "$PRESENT_REPOS" | grep -c . || true)"
+  PRESENT_COUNT="$(nlines "$PRESENT_REPOS")"
 
   # What the token reaches that MATTERS: repositories it can WRITE to, and
   # PRIVATE repositories it can read.
@@ -446,31 +503,32 @@ verify_token() {
   # GH_TOKEN pins the call to the exact token classified above. Without it, gh
   # would resolve the account itself, so a switch between the two lines would
   # mean judging one token by another's scope.
-  if [ -z "$STORED_TOKEN" ]; then
-    : # nothing to ask GitHub about; already fatal above
-  elif repos_json="$(GH_TOKEN="$STORED_TOKEN" gh api --paginate 'user/repos?per_page=100' 2>/dev/null)"; then
+  if [ -n "$STORED_TOKEN" ] \
+     && repos_json="$(GH_TOKEN="$STORED_TOKEN" gh api --paginate 'user/repos?per_page=100' 2>/dev/null)"; then
     # A jq failure means the answer is unparseable, not that the token is
     # narrow — pipefail makes the assignment fail so it lands in the same
     # "unverifiable" branch rather than looking like an empty result.
     if TOKEN_SCOPE="$(printf '%s' "$repos_json" \
         | jq -r '.[] | select(.private == true or .permissions.push == true) | .full_name' \
         | sort -u)"; then
-      TOKEN_COUNT="$(printf '%s\n' "$TOKEN_SCOPE" | grep -c . || true)"
+      TOKEN_COUNT="$(nlines "$TOKEN_SCOPE")"
 
       # (a) Isolation: the token must not reach anything that is not in the box.
-      EXTRA_LIST="$(printf '%s\n' "$TOKEN_SCOPE" \
-        | grep -vxF -f <(printf '%s\n' "$PRESENT_REPOS") || true)"
-      EXTRA_COUNT="$(printf '%s\n' "$EXTRA_LIST" | grep -c . || true)"
+      EXTRA_LIST="$(not_in "$TOKEN_SCOPE" "$PRESENT_REPOS")"
+      EXTRA_COUNT="$(nlines "$EXTRA_LIST")"
 
       # An EMPTY playground is the exception. On a fresh box there is nothing
       # checked out yet, so every repo the token reaches looks "extra" — failing
       # there would make the box impossible to start before it is used. There is
       # also nothing for an agent to be steered by yet. Report and continue.
-      if [ "$PRESENT_COUNT" -eq 0 ] 2>/dev/null; then
-        EXTRA_COUNT=0
-      elif [ "$EXTRA_COUNT" -gt 0 ] 2>/dev/null; then
-        TOKEN_BROAD=1
-        BROAD_REASON="${BROAD_REASON:-it reaches $EXTRA_COUNT repositories that are not checked out in this box}"
+      #
+      # Clear the LIST too, not just the count: leaving a populated list behind
+      # a zeroed counter is what forced the report below to test both, which
+      # reads as a redundant check and is not one.
+      if [ "$PRESENT_COUNT" -eq 0 ]; then
+        EXTRA_LIST=""; EXTRA_COUNT=0
+      elif [ "$EXTRA_COUNT" -gt 0 ]; then
+        broad "it reaches $EXTRA_COUNT repositories that are not checked out in this box"
       fi
 
       # (b) Capability: which of the repos actually here can be pushed to.
@@ -479,29 +537,37 @@ verify_token() {
       #     silence would mean discovering it an hour later at `git push`.
       PUSHABLE="$(printf '%s' "$repos_json" \
         | jq -r '.[] | select(.permissions.push == true) | .full_name' | sort -u)"
-      NOPUSH_LIST="$(printf '%s\n' "$PRESENT_REPOS" \
-        | grep -vxF -f <(printf '%s\n' "$PUSHABLE") || true)"
+      NOPUSH_LIST="$(not_in "$PRESENT_REPOS" "$PUSHABLE")"
     else
-      TOKEN_BROAD=1
-      BROAD_REASON="${BROAD_REASON:-its scope could not be verified — the answer GitHub returned about which repositories it reaches could not be parsed}"
+      broad "its scope could not be verified — the answer GitHub returned about which repositories it reaches could not be parsed"
     fi
-  else
-    TOKEN_BROAD=1
-    BROAD_REASON="${BROAD_REASON:-its scope could not be verified — asking GitHub which repositories it reaches failed, even though the token itself authenticated}"
+  elif [ -n "$STORED_TOKEN" ]; then
+    # Only when there WAS a token to ask about. With none, the classification
+    # above has already recorded why, and reasons now accumulate — so an
+    # unguarded call here would add a second, wrong one saying the request
+    # failed when no request was ever made.
+    broad "its scope could not be verified — asking GitHub which repositories it reaches failed, even though the token itself authenticated"
   fi
 
-  if [ "$TOKEN_BROAD" = 1 ]; then
+  if [ -n "$BROAD_REASONS" ]; then
     if [ "${DEVBOX_ALLOW_BROAD_TOKEN:-0}" = "1" ]; then
       warn ""
-      warn "  !! devbox: continuing with a broad token because"
-      warn "     DEVBOX_ALLOW_BROAD_TOKEN=1 ($TOKEN_KIND, reaches ${TOKEN_COUNT:-?} repos,"
-      warn "     ${EXTRA_COUNT:-?} of them not in this box)."
+      warn "  !! devbox: continuing despite DEVBOX_ALLOW_BROAD_TOKEN=1."
       warn "     This container is NOT limited to the repositories it holds."
+      warn "     Waived ($TOKEN_KIND token):"
+      # Print the ACTUAL reasons. This branch used to print a hand-written
+      # summary — token kind and repo counts — which could describe a different
+      # problem than the one that stopped the box: overriding "two credentials
+      # are reachable" reported it as a repository-scope issue. The override is
+      # also one switch over a list that grew with every review round, so
+      # naming each waived finding is the only way a newly-appeared one is
+      # visible rather than silently swallowed by a flag set months ago.
+      warn_list "$BROAD_REASONS"
       warn ""
     else
       warn ""
-      warn "  !! devbox: the GitHub token in this container is too broad —"
-      warn "     $BROAD_REASON."
+      warn "  !! devbox: the GitHub credentials in this container are too broad —"
+      warn_list "$BROAD_REASONS"
       warn ""
       # Name what was found whenever there is anything to name — with a single
       # unverifiable credential this is the only clue as to what it even is.
@@ -518,11 +584,13 @@ verify_token() {
         fi
         printf '%s\n' "$CRED_SOURCES" \
           | sed -e 's#^environment/\(.*\)$#       unset \1   (and remove it from your .env)#' \
+                -e 's#^\([^ /]*\)/?unparsed @\(.*\)$#       rm \2/hosts.yml   (a credential store this box cannot read)#' \
+                -e 's#^\([^ /]*\)/?unparsed$#       gh auth logout -h \1   (a credential store this box cannot read)#' \
                 -e 's#^\([^ /]*\)/\([^ ]*\) @\(.*\)$#       GH_CONFIG_DIR=\3 gh auth logout -h \1 -u \2#' \
                 -e 's#^\([^ /]*\)/\([^ ]*\)$#       gh auth logout -h \1 -u \2#' >&2
         warn ""
       fi
-      if [ -n "$EXTRA_LIST" ] && [ "$EXTRA_COUNT" -gt 0 ] 2>/dev/null; then
+      if [ -n "$EXTRA_LIST" ]; then
         warn "     Reaches, but not checked out here:"
         printf '%s\n' "$EXTRA_LIST" | head -20 | sed 's/^/       /' >&2
         [ "$EXTRA_COUNT" -gt 20 ] && warn "       ... and $((EXTRA_COUNT - 20)) more"
@@ -536,7 +604,10 @@ verify_token() {
       warn "       Permissions: Contents RW, Pull requests RW, Metadata RO"
       warn "     then:  gh auth login --hostname github.com --git-protocol https"
       warn ""
-      if [ "$GH_AUTH_OK" = 0 ]; then
+      # Asked here rather than eagerly at the top: this is the only reader, and
+      # it is on a path that is already dying. Every successful boot was paying
+      # a network round trip for an answer it discarded.
+      if ! gh auth status >/dev/null 2>&1; then
         warn "     Offline? The token is still on disk and becomes usable again"
         warn "     the moment the network returns, so it is checked either way."
         warn "     To start without GitHub access at all:  gh auth logout"
@@ -601,8 +672,10 @@ if [ "$GH_READY" = 1 ]; then
   name="${DEVBOX_GIT_NAME:-}"
   email="${DEVBOX_GIT_EMAIL:-}"
   if [ -z "$name" ] || [ -z "$email" ]; then
-    login="$(gh api user -q .login 2>/dev/null || true)"
-    uid="$(gh api user -q .id 2>/dev/null || true)"
+    # One request, not one per field: -q is a client-side filter, so `gh api
+    # user -q .login` and `-q .id` were two HTTPS round trips (~135 ms each,
+    # fresh TLS both times) for one object.
+    read -r login uid <<<"$(gh api user -q '.login + " " + (.id|tostring)' 2>/dev/null || true)"
     if [ -n "$login" ] && [ -n "$uid" ]; then
       name="${name:-$login}"
       email="${email:-${uid}+${login}@users.noreply.github.com}"
@@ -752,9 +825,25 @@ MSG
   exit 0
 fi
 
-if [ "$QUIET" = 0 ]; then
+if [ "$MODE" = full ]; then
+  # Report what was OBSERVED, not what was configured. These lines used to read
+  # straight from the environment, so the summary could print "push blocked"
+  # forty lines after check_guards warned that the hook was not active — and
+  # print "protected <none>" while the guard, whose own default is `main
+  # master`, was busy protecting them. A summary that contradicts a warning in
+  # the same run is the "check that lies" failure in its most visible form.
+  #
+  # The `-` (not `:-`) expansion matches guards/hooks/pre-push exactly: an
+  # empty value there means "protect nothing", and only an UNSET variable takes
+  # the default.
+  protected="${DEVBOX_PROTECTED_BRANCHES-main master}"
+  protected_note="(push blocked)"
+  [ -z "$protected" ] && { protected="<none>"; protected_note="(guard disabled)"; }
+  [ "${HOOKS_ACTIVE:-1}" = 1 ] || protected_note="(GUARD NOT ACTIVE — not blocked)"
+
   merges="blocked"
-  [ "${DEVBOX_ALLOW_MERGE:-0}" = "1" ] && merges="allowed"
+  [ "${DEVBOX_ALLOW_MERGE:-0}" = "1" ] && merges="allowed (DEVBOX_ALLOW_MERGE=1)"
+  [ "${SHIM_ACTIVE:-1}" = 1 ] || merges="NOT BLOCKED (shim not on PATH)"
   cat <<MSG
 
   ---------------------------------------------------------------------------
@@ -763,9 +852,9 @@ if [ "$QUIET" = 0 ]; then
     playground  $PLAYGROUND
     repos       $PRESENT_COUNT checked out
     commits as  $(git config --global user.name) <$(git config --global user.email)>
-    github      $(gh api user -q .login 2>/dev/null || echo '?') - $TOKEN_KIND token
+    github      ${login:-?} - $TOKEN_KIND token
     scope       reaches $TOKEN_COUNT repos, $EXTRA_COUNT of them not in this box
-    protected   ${DEVBOX_PROTECTED_BRANCHES:-<none>}   (push blocked)
+    protected   $protected   $protected_note
     merges      $merges
 
     runtimes    $(python3 --version 2>&1)  /  node $(node --version 2>/dev/null || echo '?')

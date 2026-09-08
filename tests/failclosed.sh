@@ -418,6 +418,83 @@ out=$( export PATH="/tmp/fakebin:$PATH" DEVBOX_PLAYGROUND="$PLAY" \
   || bad "XDG store missed (rc=$rc): $out"
 rm -rf "$SANDBOX/xdg" "$SANDBOX/emptycfg"
 
+echo "== a store this parser cannot read is not an empty store =="
+# gh's older single-account format has no `users:` block. The awk saw zero
+# accounts and "zero accounts" read as "no credentials", so a classic token in
+# a legacy file was invisible — the config-dir hole again, through the parser
+# instead of the path. Parsed-nothing must mean unverifiable, not empty.
+mkplay tester/alpha tester/beta
+mkdir -p "$HOME/.config/gh" "$SANDBOX/emptycfg"
+cat > "$HOME/.config/gh/hosts.yml" <<'EOF'
+github.com:
+    oauth_token: ghp_classicLEGACY
+    user: someone
+EOF
+cat > /tmp/fakebin/gh <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+  "auth token")  exit 1 ;;
+  "auth status") exit 1 ;;
+esac
+exit 1
+EOF
+chmod +x /tmp/fakebin/gh
+out=$( export PATH="/tmp/fakebin:$PATH" DEVBOX_PLAYGROUND="$PLAY" GH_CONFIG_DIR="$SANDBOX/emptycfg"; \
+       cd "$PLAY" && bash "$SETUP" 2>&1 ); rc=$?
+{ [ $rc -ne 0 ] && echo "$out" | grep -q "?unparsed"; } \
+  && ok "a legacy-format store is reported, not read as absent" \
+  || bad "legacy hosts.yml was invisible (rc=$rc): $out"
+echo "$out" | grep -q "rm .*hosts.yml" \
+  && ok "names the file to remove" || bad "no remediation for the unreadable store"
+
+# A genuinely absent store must still be absent — the tri-state must not
+# collapse the other way and make every box unstartable.
+rm -f "$HOME/.config/gh/hosts.yml"
+out=$( export PATH="/tmp/fakebin:$PATH" DEVBOX_PLAYGROUND="$PLAY" GH_CONFIG_DIR="$SANDBOX/emptycfg"; \
+       cd "$PLAY" && bash "$SETUP" 2>&1 ); rc=$?
+{ [ $rc -eq 0 ] && echo "$out" | grep -q "one-time GitHub setup needed"; } \
+  && ok "no store at all is still 'not logged in'" \
+  || bad "absent store misread as unparsed (rc=$rc): $out"
+rm -rf "$SANDBOX/emptycfg"
+
+echo "== every Docker credential shape is detected, not just auths =="
+# credsStore and credHelpers are what VS Code's dockerCredentialHelper actually
+# writes — the exact channel this check names in its own advice — and matching
+# only "auths" walked past both.
+mkgh "github_pat_x" "$SCOPED"
+for shape in '{"auths":{"ghcr.io":{"auth":"eA=="}}}' \
+             '{"credsStore":"desktop"}' \
+             '{"credHelpers":{"ghcr.io":"desktop"}}'; do
+  rm -rf "$HOME/.docker"; mkdir -p "$HOME/.docker"
+  printf '%s\n' "$shape" > "$HOME/.docker/config.json"
+  out=$(run); rc=$?
+  { [ $rc -eq 0 ] && [ ! -e "$HOME/.docker/config.json" ] \
+    && echo "$out" | grep -q "deleted host Docker"; } \
+    && ok "detected and removed: ${shape:0:28}" \
+    || bad "NOT detected: $shape (rc=$rc)"
+done
+rm -rf "$HOME/.docker"
+
+echo "== the summary reports what was observed, not what was configured =="
+# These lines used to read straight from the environment, so the box could
+# print "protected <none>" while the guard's own default protected main+master,
+# and "push blocked" in the same run as a warning that the hook was inactive.
+mkplay tester/alpha tester/beta
+mkgh "github_pat_x" "$SCOPED"
+out=$(run); rc=$?
+echo "$out" | grep -qE "protected +main master" \
+  && ok "an unset DEVBOX_PROTECTED_BRANCHES reports the guard's real default" \
+  || bad "summary disagrees with the guard default: $(echo "$out" | grep protected)"
+out=$(DEVBOX_PROTECTED_BRANCHES="" run)
+echo "$out" | grep -q "guard disabled" \
+  && ok "an empty value reports the guard as disabled, not as blocking" \
+  || bad "empty value mis-reported: $(echo "$out" | grep protected)"
+# The suite's fake gh shadows the shim on PATH, so this run genuinely has no
+# merge guard — the summary must say so rather than printing "blocked".
+echo "$out" | grep -q "NOT BLOCKED" \
+  && ok "merges reported NOT BLOCKED when the shim is not on PATH" \
+  || bad "summary claimed merges were blocked with no shim: $(echo "$out" | grep merges)"
+
 echo "== undeletable Docker credentials are fatal, not announced as deleted =="
 # The message used to claim deletion regardless of whether rm worked.
 rm -rf "$HOME/.docker"; mkdir -p "$HOME/.docker"
@@ -462,7 +539,7 @@ rm -rf "$LOCK"; mkdir -p "$LOCK"
 perl -MIO::Socket::UNIX -e \
   'IO::Socket::UNIX->new(Local=>q('"$LOCK"'/vscode-ssh-auth-x.sock), Listen=>1) or die; sleep 60' &
 sockpid=$!
-timeout 10 bash -c "until [ -S $LOCK/vscode-ssh-auth-x.sock ]; do :; done"
+timeout 10 bash -c "until [ -S $LOCK/vscode-ssh-auth-x.sock ]; do sleep 0.02; done"
 chmod 500 "$LOCK"
 if [ -S "$LOCK/vscode-ssh-auth-x.sock" ]; then
   mkgh "github_pat_x" "$SCOPED"
@@ -484,7 +561,7 @@ FREE="$SANDBOX/freedir"; rm -rf "$FREE"; mkdir -p "$FREE"
 perl -MIO::Socket::UNIX -e \
   'IO::Socket::UNIX->new(Local=>q('"$FREE"'/vscode-ssh-auth-y.sock), Listen=>1) or die; sleep 60' &
 sockpid=$!
-timeout 10 bash -c "until [ -S $FREE/vscode-ssh-auth-y.sock ]; do :; done"
+timeout 10 bash -c "until [ -S $FREE/vscode-ssh-auth-y.sock ]; do sleep 0.02; done"
 out=$( export PATH="/tmp/fakebin:$PATH" DEVBOX_PLAYGROUND="$PLAY" TMPDIR="$FREE"; \
        cd "$PLAY" && bash "$SETUP" 2>&1 ); rc=$?
 { [ $rc -eq 0 ] && [ ! -e "$FREE/vscode-ssh-auth-y.sock" ]; } \

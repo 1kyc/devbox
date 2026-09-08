@@ -53,19 +53,6 @@ ARG USER_GID=1000
 RUN groupadd --gid "$USER_GID" "$USERNAME" \
  && useradd --uid "$USER_UID" --gid "$USER_GID" --create-home --shell /bin/bash "$USERNAME"
 
-# The guardrails (see README). Root-owned and outside the playground ON PURPOSE:
-# an agent running as $USERNAME cannot rewrite them, unlike anything that lives
-# in a mounted repo.
-COPY guards/ /usr/local/share/devbox/
-# setup.sh joins them on the image rather than being run from a mounted repo.
-# It is the script that decides whether the box is safe to start, so it should
-# not be something an agent in bypass mode can edit. (In the per-repo dev
-# container it lived in the workspace, and it could.)
-COPY setup.sh /usr/local/share/devbox/setup.sh
-RUN chmod 0755 /usr/local/share/devbox/bin/* /usr/local/share/devbox/hooks/* \
-                /usr/local/share/devbox/setup.sh \
- && chown -R root:root /usr/local/share/devbox
-
 # Pre-create the directories that named volumes mount onto, owned by the user,
 # so each fresh volume inherits that ownership on first init. There is no sudo
 # at runtime, so a missed chown here is unrecoverable without a rebuild.
@@ -85,7 +72,11 @@ RUN mkdir -p "/home/$USERNAME/.claude" "/home/$USERNAME/.codex" \
 # installer below sites its work off $HOME.
 ENV HOME=/home/$USERNAME
 ENV FNM_DIR=/home/$USERNAME/.local/share/fnm
-ENV PATH=/usr/local/share/devbox/bin:/home/$USERNAME/.local/bin:$FNM_DIR/aliases/default/bin:$PATH
+# Defined ONCE and used twice below. Spelling this list out in both places is
+# how the login-shell restore silently drifts from the image PATH — and a drift
+# that drops the guard dir is exactly the failure the restore exists to prevent.
+ENV DEVBOX_PATH=/usr/local/share/devbox/bin:/home/$USERNAME/.local/bin:$FNM_DIR/aliases/default/bin
+ENV PATH=$DEVBOX_PATH:$PATH
 
 # ENV alone is not enough: a LOGIN shell (bash -l, some task runners) sources
 # /etc/profile, which overwrites PATH with a fixed default — dropping node and,
@@ -94,7 +85,7 @@ ENV PATH=/usr/local/share/devbox/bin:/home/$USERNAME/.local/bin:$FNM_DIR/aliases
 # the entries back. Root-owned, like the guards.
 RUN printf '%s\n' \
       '# devbox: restore PATH after /etc/profile resets it for login shells.' \
-      "PATH=\"/usr/local/share/devbox/bin:/home/$USERNAME/.local/bin:$FNM_DIR/aliases/default/bin:\$PATH\"" \
+      "PATH=\"$DEVBOX_PATH:\$PATH\"" \
       'export PATH' \
       > /etc/profile.d/10-devbox-path.sh \
  && chmod 0644 /etc/profile.d/10-devbox-path.sh
@@ -172,5 +163,23 @@ RUN curl -fsSL https://fnm.vercel.app/install -o /tmp/install-fnm.sh \
  && "$HOME/.local/bin/fnm" install "$NODE_VERSION" \
  && "$HOME/.local/bin/fnm" alias "$NODE_VERSION" default \
  && "$FNM_DIR/aliases/default/bin/corepack" enable --install-directory "$HOME/.local/bin"
+
+# --- guards ------------------------------------------------------------------
+#
+# LAST on purpose. These are the files under active development in this repo,
+# and everything above them is ~1.06 GB of vendor downloads (Claude 335 MB,
+# Codex 335 MB, Node 228 MB, Python 158 MB). Copied in earlier, a one-character
+# edit to setup.sh invalidated all four installer layers and a comment fix cost
+# a full re-download. Nothing above consumes them, so they belong here.
+#
+# Root-owned and outside the playground ON PURPOSE: an agent running as
+# $USERNAME cannot rewrite them, unlike anything in a mounted repo. setup.sh
+# joins them rather than being run from a mount for the same reason — it is the
+# script that decides whether the box is safe to start. (In the per-repo dev
+# container it lived in the workspace, and an agent could edit it.)
+USER root
+COPY --chown=root:root --chmod=0755 guards/ /usr/local/share/devbox/
+COPY --chown=root:root --chmod=0755 setup.sh /usr/local/share/devbox/setup.sh
+USER $USERNAME
 
 CMD ["bash"]
