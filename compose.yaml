@@ -23,6 +23,11 @@ services:
         NODE_VERSION: ${NODE_VERSION:-lts-latest}
     image: devbox:local
     container_name: ${DEVBOX_NAME:-devbox}
+    # Without this the hostname is the container ID, so the shell prompt reads
+    # kyc@7670b495c3d8 and changes on every rebuild. A fixed name keeps it
+    # stable and makes "am I inside the box?" answerable at a glance — worth
+    # something when the thing inside runs without approval prompts.
+    hostname: ${DEVBOX_NAME:-devbox}
 
     # The playground is mounted at THE SAME ABSOLUTE PATH inside the container
     # as on the host. This is not tidiness: a git worktree records absolute
