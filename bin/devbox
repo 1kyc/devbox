@@ -35,23 +35,25 @@ fi
 # The box is only useful when it is up; shelling into a stopped box should start
 # it rather than erroring at you.
 #
-# A name query, not `compose ps` + `docker inspect`. Both of those serialize an
-# existing container's full inspect payload and measure ~3 s EACH on Docker
-# Desktop, so the old pair cost 6.1 s in front of every interactive command —
-# far more than everything setup.sh does at boot. This is ~30 ms.
+# Just ask compose. `up -d` on an already-running box measures 156-268 ms and
+# leaves it strictly alone (same container id, same StartedAt), which is cheap
+# enough next to the ~3 s `docker exec` that follows.
 #
-# By CONTAINER NAME, which compose.yaml sets explicitly, not by compose project
-# label: `${PWD##*/}` is merely compose's *default* project name, and
-# COMPOSE_PROJECT_NAME, a top-level `name:`, or `-p` all override it. Guessing
-# it wrong both restarted a running custom-named box and — worse — found some
-# other project's default-named container and skipped starting this one.
-NAME="$(sed -n 's/^DEVBOX_NAME=[[:space:]]*//p' .env | tr -d "\"' " | head -1)"
-NAME="${NAME:-devbox}"
-
-ensure_up() {
-  [ -n "$(docker container ls -q -f name="^${NAME}\$" -f status=running 2>/dev/null)" ] \
-    || docker compose up -d
-}
+# Two previous versions tried to answer "is it already up?" ourselves and both
+# were wrong, in the same way:
+#
+#   `compose ps` + `docker inspect`  correct, but ~3 s EACH on Docker Desktop —
+#                                    6.1 s in front of every command
+#   a compose project label          ${PWD##*/} is only compose's DEFAULT
+#                                    project name; -p, COMPOSE_PROJECT_NAME and
+#                                    a top-level `name:` all override it
+#   a container name from .env       ignores an exported DEVBOX_NAME, and
+#                                    hand-parses a file with compose's
+#                                    interpolation and comment rules
+#
+# Each fix moved the same bug: re-deriving configuration that compose already
+# resolves. The cheapest correct answer is not to re-derive it.
+ensure_up() { docker compose up -d >/dev/null; }
 
 # `exec docker compose` stays spelled out inside the function, so this cannot
 # regress into the `exec dc` mistake above.

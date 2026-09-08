@@ -384,49 +384,50 @@ gh_stored_accounts() {
 }
 
 gh_accounts_in() {
-  local hosts="$1/hosts.yml" found
+  local hosts="$1/hosts.yml"
   [ -f "$hosts" ] || return 0
 
-  # A store that exists but yields NOTHING is not an empty store — it is a store
-  # this parser did not understand, and the difference is a credential.
+  # Completeness is judged PER HOST, not per file.
   #
-  # gh's older single-account format has no `users:` block at all:
+  # gh has two layouts. The modern one nests accounts under `users:`; the older
+  # single-account one has no `users:` block at all:
   #
   #     github.com:
   #         oauth_token: ghp_...
   #         user: someone
   #
-  # gh still reads it; this awk sees zero accounts. Reported as "no accounts"
-  # it becomes "not logged in", and a classic token sits there unexamined —
-  # which is the config-dir hole again through a different door. The rule this
-  # file already applies to GitHub's API answers ("unparseable is not narrow")
-  # applies with more force to a parser we wrote ourselves.
-  found="$(gh_parse_users "$hosts")"
-  if [ -z "$found" ] && grep -qE '^[ \t]*(oauth_token|user):' "$hosts"; then
-    printf '%s/?unparsed\n' "$(gh_first_host "$hosts")"
-    return 0
-  fi
-  printf '%s' "${found:+$found$'\n'}"
-}
-
-# The first host key in a hosts.yml, for labelling a store we could not parse.
-gh_first_host() {
-  awk '/^[^ \t#]/ && /:[ \t]*$/ { sub(/:[ \t]*$/, ""); print; exit }' "$1"
-}
-
-gh_parse_users() {
-  local hosts="$1"
-  # Accounts are the keys one level inside a host's `users:` block. The first
-  # key encountered fixes the indent, so 2- and 4-space files both parse.
+  # gh reads both. An earlier version only flagged a file as unreadable when it
+  # yielded ZERO accounts, so a file mixing the two — a modern github.com entry
+  # and a legacy enterprise one — parsed the first, looked successful, and the
+  # second host disappeared with its token. Parsing one section is no evidence
+  # that the rest was understood.
+  #
+  # So each host resolves to either its accounts or `<host>/?unparsed`, and the
+  # caller treats an unparsed host as a stop in its own right.
   awk '
+    function flush() {
+      if (host != "" && !sawusers && sawfields) print host "/?unparsed"
+    }
     { match($0, /^[ \t]*/); ind = RLENGTH }
-    /^[^ \t#]/ && /:[ \t]*$/ { host = $0; sub(/:[ \t]*$/, "", host); inu = 0; next }
-    /^[ \t]*users:[ \t]*$/   { inu = 1; uind = ind; aind = -1; next }
+    # A new top-level host key closes out the previous one.
+    /^[^ \t#]/ && /:[ \t]*$/ {
+      flush()
+      host = $0; sub(/:[ \t]*$/, "", host)
+      sawusers = 0; sawfields = 0; inu = 0
+      next
+    }
+    /^[ \t]*users:[ \t]*$/ { inu = 1; sawusers = 1; uind = ind; aind = -1; next }
     inu && NF && ind <= uind { inu = 0 }
+    # Accounts are the keys one level inside `users:`. The first key encountered
+    # fixes the indent, so 2- and 4-space files both parse.
     inu && /:[ \t]*$/ {
       if (aind < 0) aind = ind
       if (ind == aind) { a = $0; gsub(/[ \t]/, "", a); sub(/:$/, "", a); print host "/" a }
+      next
     }
+    # Host-level credential fields with no `users:` block: the legacy layout.
+    !inu && /^[ \t]+(oauth_token|user):/ { sawfields = 1 }
+    END { flush() }
   ' "$hosts"
 }
 

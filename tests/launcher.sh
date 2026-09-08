@@ -65,30 +65,48 @@ if [ -L "$SANDBOX_LINK" ]; then
   rm -f "$SANDBOX_LINK"
 fi
 
-echo "== the running-box lookup is by container name, exactly =="
-# It briefly filtered on the compose project label derived from ${PWD##*/} —
-# only compose's DEFAULT project name. COMPOSE_PROJECT_NAME, a top-level
-# `name:`, or -p all override it, so the guess both restarted a running
-# custom-named box and found some OTHER project's default-named container and
-# skipped starting this one. compose.yaml sets container_name explicitly, so
-# the name is the thing we actually control.
-NAME="$(sed -n 's/^DEVBOX_NAME=[[:space:]]*//p' "$REPO/.env" | tr -d "\"' " | head -1)"
-NAME="${NAME:-devbox}"
-grep -q 'docker container ls -q -f name=' "$DEVBOX" \
-  && ok "looks the box up by name, not by a guessed project label" \
-  || bad "the running-box lookup is not name-based"
-# Comments stripped: the file explains the old approach by name, and matching
-# that prose is not the same as still doing it.
-grep -v '^[[:space:]]*#' "$DEVBOX" | grep -q 'PWD##\*/' \
-  && bad "still derives a compose project name from the working directory" \
-  || ok "does not guess the compose project from \$PWD"
+echo "== an exported compose override is honoured, not re-derived =="
+# Behavioural, not a source grep. Two previous versions answered "is it already
+# up?" by re-deriving compose's configuration — first a project name from
+# ${PWD##*/}, then a container name hand-parsed out of .env — and both ignored
+# an exported override, so the launcher looked for the wrong box: it skipped
+# starting a stopped one because some other container matched.
+#
+# Run the launcher under a project name that exists only for this test. If it
+# still resolves configuration itself, it will look at the default project,
+# conclude the box is already running, and start nothing.
+ALT=devbox-launchertest
+cleanup_alt() {
+  ( cd "$REPO" && COMPOSE_PROJECT_NAME="$ALT" docker compose down -v ) >/dev/null 2>&1 || true
+}
+trap 'cleanup_alt; rm -rf "$(dirname "$SANDBOX_LINK")"' EXIT
+cleanup_alt
 
-[ -n "$(docker container ls -q -f name="^${NAME}\$" -f status=running)" ] \
-  && ok "the anchored name filter finds the running box ($NAME)" \
-  || bad "anchored name filter did not find $NAME"
-[ -z "$(docker container ls -q -f name="^${NAME}-nope\$" -f status=running)" ] \
-  && ok "and does not match a different container" \
-  || bad "the name filter is not anchored"
+# DEVBOX_NAME and CODEX_LOGIN_PORT too. The box is a singleton by design — a
+# pinned container_name and a fixed loopback port — so a second copy needs both
+# overridden to coexist with the real one for the length of this test.
+( cd "$REPO" && COMPOSE_PROJECT_NAME="$ALT" DEVBOX_NAME="$ALT" CODEX_LOGIN_PORT=14559 \
+    "$DEVBOX" up ) >/dev/null 2>&1
+alt_id="$(docker container ls -q -f label=com.docker.compose.project="$ALT" -f status=running)"
+[ -n "$alt_id" ] \
+  && ok "an exported COMPOSE_PROJECT_NAME starts THAT project's box" \
+  || bad "the override was ignored; no container for project $ALT"
+
+# And the main box must be untouched by it.
+[ -n "$(docker container ls -q -f name='^devbox$' -f status=running)" ] \
+  && ok "the default box is left running alongside it" \
+  || bad "the override disturbed the default box"
+cleanup_alt
+
+# No hand-rolled config resolution should remain (comments stripped — the file
+# explains the discarded approaches by name, and matching that prose is not the
+# same as still doing it).
+# Checking that .env EXISTS is fine — compose needs it. Reading values out of
+# it, or guessing a project name from $PWD, is the thing that kept being wrong.
+code="$(grep -v '^[[:space:]]*#' "$DEVBOX")"
+printf '%s' "$code" | grep -qE 'PWD##\*/|DEVBOX_NAME' \
+  && bad "still re-derives compose configuration itself" \
+  || ok "does not re-derive compose configuration"
 
 echo "== dispatch =="
 for c in status logs; do

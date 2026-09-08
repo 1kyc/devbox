@@ -436,6 +436,45 @@ for n in target vendor node_modules .venv; do
     || bad "repo named '$n' was skipped, disabling scope enforcement (rc=$rc)"
 done
 
+echo "== parsing one host does not vouch for the rest of the file =="
+# The unparsed marker once fired only when the file yielded ZERO accounts, so a
+# file mixing layouts — a modern github.com block and a legacy enterprise one —
+# parsed the first, looked successful, and the second host vanished with its
+# classic token. Completeness has to be judged per host.
+mkplay tester/alpha tester/beta
+mkgh "github_pat_x" "$SCOPED"          # the selected token verifies cleanly
+cat > "$GHCFG/hosts.yml" <<'EOF'
+github.com:
+    users:
+        someone:
+            oauth_token: github_pat_x
+    user: someone
+    oauth_token: github_pat_x
+ghe.example.com:
+    oauth_token: ghp_classicENTERPRISE
+    user: someone
+EOF
+out=$(run); rc=$?
+{ [ $rc -ne 0 ] && echo "$out" | grep -q "ghe.example.com/?unparsed"; } \
+  && ok "a legacy host beside a modern one is flagged, not swallowed" \
+  || bad "mixed-layout file passed (rc=$rc): $out"
+echo "$out" | grep -q "github.com/someone" \
+  && ok "and the modern host is still parsed normally" \
+  || bad "the parsed host was lost"
+
+# A wholly modern multi-host file must NOT be flagged.
+cat > "$GHCFG/hosts.yml" <<'EOF'
+github.com:
+    users:
+        someone:
+            oauth_token: github_pat_x
+    user: someone
+EOF
+out=$(run); rc=$?
+[ $rc -eq 0 ] && ok "a fully parseable file is not flagged as unreadable" \
+  || bad "false positive on a modern file (rc=$rc): $out"
+rm -f "$GHCFG/hosts.yml"
+
 echo "== an unreadable store stops the box on its own =="
 # Not merely one more entry in the count: a legacy file holding TWO hosts
 # collapses to one "?unparsed" line, so with a selected token that verifies
