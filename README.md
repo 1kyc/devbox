@@ -74,7 +74,8 @@ against the repositories checked out in the playground:
 |---|---|
 | Token reaches a repo that is **not** in the box | **hard stop**, names the repo |
 | Classic or OAuth token | **hard stop** — those carry your whole account |
-| More than one credential reachable (second account, or GH_TOKEN over a stored token) | **hard stop** — only the selected one can be checked |
+| More than one credential reachable (second account, GH_TOKEN over a stored token, an enterprise token) | **hard stop** — only the selected one can be checked |
+| A credential devbox cannot verify (enterprise host) | **hard stop** — github.com credentials only |
 | Scope cannot be verified (API error, offline, unparseable answer) | **hard stop** |
 | A repo in the box the token cannot push to | warning, box starts |
 | Playground empty (fresh box) | reported, box starts |
@@ -181,7 +182,7 @@ bash tests/worktree-roundtrip.sh
 bash tests/launcher.sh
 ```
 
-118 assertions: the box's invariants, the scope check's refusals (with a fake
+126 assertions: the box's invariants, the scope check's refusals (with a fake
 `gh`), and the worktree round-trip.
 
 ## Troubleshooting

@@ -295,6 +295,56 @@ out=$(run); rc=$?
 rm -f "$GHCFG/hosts.yml"
 [ -f /tmp/hosts.bak ] && mv /tmp/hosts.bak "$GHCFG/hosts.yml"
 
+echo "== a credential for another host is not mistaken for no credential =="
+# `gh auth token` resolves github.com. A credential gh holds for a different
+# host returns nothing there, which used to take the "not logged in" exit
+# BEFORE enumeration ran — while `gh auth token --hostname ghe.example` handed
+# it over perfectly well. Enumeration has to come first.
+rm -f "$GHCFG/hosts.yml"
+mkplay tester/alpha tester/beta
+cat > /tmp/fakebin/gh <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+  "auth token")  exit 1 ;;          # nothing for github.com
+  "auth status") exit 1 ;;
+esac
+exit 1
+EOF
+chmod +x /tmp/fakebin/gh
+out=$( export PATH="/tmp/fakebin:$PATH" DEVBOX_PLAYGROUND="$PLAY" \
+              GH_ENTERPRISE_TOKEN=ghp_enterpriseONE; \
+       cd "$PLAY" && bash "$SETUP" 2>&1 ); rc=$?
+{ [ $rc -ne 0 ] && echo "$out" | grep -q "cannot verify"; } \
+  && ok "a lone enterprise credential is refused, not read as unauthenticated" \
+  || bad "enterprise-only credential started the box (rc=$rc): $out"
+echo "$out" | grep -q "environment/GH_ENTERPRISE_TOKEN" \
+  && ok "names the enterprise variable" || bad "did not name it"
+
+# Two of them, with nothing for github.com: still caught, and counted as two.
+out=$( export PATH="/tmp/fakebin:$PATH" DEVBOX_PLAYGROUND="$PLAY" \
+              GH_ENTERPRISE_TOKEN=ghp_one GITHUB_ENTERPRISE_TOKEN=ghp_two; \
+       cd "$PLAY" && bash "$SETUP" 2>&1 ); rc=$?
+{ [ $rc -ne 0 ] && echo "$out" | grep -q "2 GitHub credentials are reachable"; } \
+  && ok "two enterprise credentials count as two, not zero" \
+  || bad "enterprise pair miscounted (rc=$rc): $out"
+
+# And with genuinely nothing set, the same fake gh must still start the box.
+out=$( export PATH="/tmp/fakebin:$PATH" DEVBOX_PLAYGROUND="$PLAY"; \
+       cd "$PLAY" && bash "$SETUP" 2>&1 ); rc=$?
+{ [ $rc -eq 0 ] && echo "$out" | grep -q "one-time GitHub setup needed"; } \
+  && ok "zero sources still means unauthenticated, not failure" \
+  || bad "zero-source start broke (rc=$rc): $out"
+
+# A token gh will hand over that enumeration cannot attribute — a keyring, or a
+# config shape the parser does not know — is still a credential. Counting only
+# enumerated sources called this "not logged in" and started the box.
+rm -f "$GHCFG/hosts.yml"
+mkgh "ghp_classicKEYRING" "$SCOPED"   # returns a token; nothing on disk explains it
+out=$(run); rc=$?
+{ [ $rc -ne 0 ] && echo "$out" | grep -q "classic token"; } \
+  && ok "a token with no enumerable source is still checked" \
+  || bad "unattributed token was ignored (rc=$rc): $out"
+
 echo "== undeletable Docker credentials are fatal, not announced as deleted =="
 # The message used to claim deletion regardless of whether rm worked.
 rm -rf "$HOME/.docker"; mkdir -p "$HOME/.docker"
