@@ -326,7 +326,6 @@ TOKEN_SCOPE=""
 TOKEN_COUNT=0
 EXTRA_LIST=""
 EXTRA_COUNT=0
-NOPUSH_LIST=""
 BROAD_REASONS=""
 
 # Verification only — it writes nothing, so --audit can call it too. Dies if the
@@ -552,14 +551,37 @@ verify_token() {
     # A jq failure means the answer is unparseable, not that the token is
     # narrow — pipefail makes the assignment fail so it lands in the same
     # "unverifiable" branch rather than looking like an empty result.
-    if TOKEN_SCOPE="$(printf '%s' "$repos_json" \
-        | jq -r '.[] | select(.private == true or .permissions.push == true) | .full_name' \
-        | sort -u)"; then
-      TOKEN_COUNT="$(nlines "$TOKEN_SCOPE")"
+    # `.permissions` on this endpoint is YOUR ROLE on the repo, not the token's
+    # grant. For a repo you own it is always {push: true, admin: true}, whatever
+    # the token was scoped to — so a PAT limited to three repositories and a PAT
+    # granted every repository return byte-identical listings. Selecting on it
+    # measured how many repos you own. There is no API that reports a
+    # fine-grained PAT's repository grant (`installation/repositories` refuses a
+    # PAT), so the grant has to be OBSERVED rather than read.
+    #
+    # Private repos are decidable: the token can fetch one only if it was
+    # granted it, and a repo outside the grant 404s. Public repos are not —
+    # every token reads them, and proving WRITE access would mean attempting a
+    # write. So the candidate set is: private, owned, not checked out here.
+    # Public repos stay uncounted, which is the rule this check already applied
+    # for reads, now applied honestly to writes as well. See DESIGN.md.
+    if candidates="$(printf '%s' "$repos_json" \
+        | jq -r '.[] | select(.private == true) | .full_name' | sort -u)"; then
+      candidates="$(not_in "$candidates" "$PRESENT_REPOS")"
 
-      # (a) Isolation: the token must not reach anything that is not in the box.
-      EXTRA_LIST="$(not_in "$TOKEN_SCOPE" "$PRESENT_REPOS")"
+      EXTRA_LIST=""
+      while IFS= read -r repo; do
+        [ -n "$repo" ] || continue
+        if GH_TOKEN="$STORED_TOKEN" gh api "repos/$repo" --silent >/dev/null 2>&1; then
+          EXTRA_LIST="${EXTRA_LIST:+$EXTRA_LIST$'\n'}$repo"
+        fi
+      done <<< "$candidates"
       EXTRA_COUNT="$(nlines "$EXTRA_LIST")"
+
+      # What the token is known to reach: what is here, plus the extras proven
+      # above. It is a floor, not a total — see the coverage note in DESIGN.md.
+      TOKEN_SCOPE="$(printf '%s\n%s' "$PRESENT_REPOS" "$EXTRA_LIST" | grep -c . || true)"
+      TOKEN_COUNT="$TOKEN_SCOPE"
 
       # An EMPTY playground is the exception. On a fresh box there is nothing
       # checked out yet, so every repo the token reaches looks "extra" — failing
@@ -575,13 +597,13 @@ verify_token() {
         broad "it reaches $EXTRA_COUNT repositories that are not checked out in this box"
       fi
 
-      # (b) Capability: which of the repos actually here can be pushed to.
-      #     Unlike the one-repo box this is NOT fatal — cloning something you
-      #     can only read (an OSS project you are studying) is normal here. But
-      #     silence would mean discovering it an hour later at `git push`.
-      PUSHABLE="$(printf '%s' "$repos_json" \
-        | jq -r '.[] | select(.permissions.push == true) | .full_name' | sort -u)"
-      NOPUSH_LIST="$(not_in "$PRESENT_REPOS" "$PUSHABLE")"
+      # There is deliberately no "can it push here?" check any more. It read
+      # `.permissions.push` from the same listing, which — being your role — is
+      # true for every repo you own, so it could never fire for the repos this
+      # box actually holds. A check that cannot fire is worse than none: it
+      # implies coverage that does not exist. Determining write access without
+      # writing is not possible through the API, so the honest answer is to say
+      # so (DESIGN.md) rather than to keep a reassuring no-op.
     else
       broad "its scope could not be verified — the answer GitHub returned about which repositories it reaches could not be parsed"
     fi
@@ -634,15 +656,30 @@ verify_token() {
                 -e 's#^\([^ /]*\)/\([^ ]*\)$#       gh auth logout -h \1 -u \2#' >&2
         warn ""
       fi
+      # Two ways out of drift, and only one of them used to be offered. Naming
+      # just the token made the box look like it demanded you narrow the token
+      # BEFORE you could clone — which reads as a chicken-and-egg problem and is
+      # not one: the playground is bind-mounted, so cloning happens on the host
+      # with your own credentials and never needs the box's token at all.
       if [ -n "$EXTRA_LIST" ]; then
         warn "     Reaches, but not checked out here:"
         printf '%s\n' "$EXTRA_LIST" | head -20 | sed 's/^/       /' >&2
         [ "$EXTRA_COUNT" -gt 20 ] && warn "       ... and $((EXTRA_COUNT - 20)) more"
         warn ""
+        warn "     Repository scope is the boundary everything else here rests on,"
+        warn "     so this is a hard stop rather than a warning. Either bring the"
+        warn "     repo in, or take it off the token."
+        warn ""
+        warn "     Bring it in — on the HOST, not in here. ${DEVBOX_PLAYGROUND:-the playground}"
+        warn "     is mounted from your machine, so your own credentials do it:"
+        warn "       cd ${DEVBOX_PLAYGROUND:-<playground>} && gh repo clone <owner/name>"
+        warn ""
+        warn "     Or narrow the token to exactly the repos in this box:"
+      else
+        warn "     Repository scope is the boundary everything else here rests on,"
+        warn "     so this is a hard stop rather than a warning. Re-issue a"
+        warn "     fine-grained token listing exactly the repos in this box:"
       fi
-      warn "     Repository scope is the boundary everything else here rests on,"
-      warn "     so this is a hard stop rather than a warning. Re-issue a"
-      warn "     fine-grained token listing exactly the repos in this box:"
       warn "       https://github.com/settings/personal-access-tokens"
       warn "       Repository access: Only select repositories"
       warn "       Permissions: Contents RW, Pull requests RW, Metadata RO"
@@ -830,15 +867,6 @@ check_guards
 # ---------------------------------------------------------------------------
 # 7. Summary.
 # ---------------------------------------------------------------------------
-if [ -n "$NOPUSH_LIST" ]; then
-  warn ""
-  warn "  !  devbox: the token cannot push to these repositories in the box:"
-  printf '%s\n' "$NOPUSH_LIST" | sed 's/^/       /' >&2
-  warn "     Committing works; pushing a branch will not. Fine if they are"
-  warn "     read-only on purpose."
-  warn ""
-fi
-
 if [ "$GH_READY" = 0 ]; then
   cat <<'MSG'
 
@@ -901,7 +929,8 @@ if [ "$MODE" = full ]; then
     repos       $PRESENT_COUNT checked out
     commits as  $(git config --global user.name) <$(git config --global user.email)>
     github      ${login:-?} - $TOKEN_KIND token
-    scope       reaches $TOKEN_COUNT repos, $EXTRA_COUNT of them not in this box
+    scope       reaches >=$TOKEN_COUNT repos, $EXTRA_COUNT of them not in this box
+                (a floor: public-repo grants are not detectable — DESIGN.md)
     protected   $protected   $protected_note
     merges      $merges
 

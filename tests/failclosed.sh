@@ -56,10 +56,20 @@ mkplay() {
 # A fake gh whose token kind and repo list we control. Page two is served ONLY
 # when --paginate is passed, so a test that depends on it proves the flag is
 # really being used rather than that we meant to use it.
+#
+# What the token can FETCH is a separate knob from what it LISTS, because on
+# GitHub they are separate things: `user/repos` returns what you OWN, so a
+# fine-grained PAT granted three repositories still lists all nine. The two have
+# to move independently here or the fixtures cannot express the bug this check
+# exists to catch. Default: the token reaches nothing beyond the box; `grant`
+# widens it.
+grant() { printf '%s\n' "$@" > /tmp/fakebin/granted; }
+
 mkgh() { # <token> <page1-json> [page2-json]
   mkdir -p /tmp/fakebin
   printf '%s\n' "$2" > /tmp/fakebin/repos.json
   : > /tmp/fakebin/repos-page2.json
+  : > /tmp/fakebin/granted
   [ -n "${3:-}" ] && printf '%s\n' "$3" > /tmp/fakebin/repos-page2.json
   cat > /tmp/fakebin/gh <<EOF
 #!/usr/bin/env bash
@@ -67,6 +77,9 @@ case "\$*" in
   "auth status") exit 0 ;;
   "auth token")  echo "$1"; exit 0 ;;
   "auth setup-git") exit 0 ;;
+  # The scope probe: 200 inside the token's grant, 404 outside it. This is the
+  # only thing here that tells a narrow token from a wide one.
+  "api repos/"*) grep -qxF "\${2#repos/}" /tmp/fakebin/granted || exit 1; exit 0 ;;
   *"user -q .login") echo tester; exit 0 ;;
   *"user -q .id")    echo 4242; exit 0 ;;
   *--paginate*user/repos*) cat /tmp/fakebin/repos.json /tmp/fakebin/repos-page2.json 2>/dev/null; exit 0 ;;
@@ -81,21 +94,24 @@ run() { ( export PATH="/tmp/fakebin:$PATH" DEVBOX_PLAYGROUND="$PLAY"; cd "$PLAY"
 
 # Exactly the repos in the box, plus the read-only public access GitHub always
 # grants a fine-grained token. This is the case that must NOT be rejected.
+#
+# Every repo the user OWNS carries push+admin, because that is what GitHub
+# really returns: `.permissions` on this endpoint is your ROLE, not the token's
+# grant, so it reads true for all of them however narrow the token is. The
+# fixtures say so out loud — a check that goes back to believing that field
+# fails here instead of quietly measuring how many repos you own.
 SCOPED='[
- {"full_name":"tester/alpha","private":false,"permissions":{"push":true}},
- {"full_name":"tester/beta","private":true,"permissions":{"push":true}},
- {"full_name":"someone/oss","private":false,"permissions":{"push":false}}]'
-# The same, plus one repo that is NOT checked out here. This is the drift.
+ {"full_name":"tester/alpha","private":false,"permissions":{"push":true,"admin":true}},
+ {"full_name":"tester/beta","private":true,"permissions":{"push":true,"admin":true}},
+ {"full_name":"someone/oss","private":false,"permissions":{"push":false,"admin":false}}]'
+# The same, plus one private repo that is NOT checked out here. That is only
+# drift if the token can actually reach it, so tests pair this with `grant`.
 DRIFTED='[
- {"full_name":"tester/alpha","private":false,"permissions":{"push":true}},
- {"full_name":"tester/beta","private":true,"permissions":{"push":true}},
- {"full_name":"tester/secrets","private":true,"permissions":{"push":true}}]'
+ {"full_name":"tester/alpha","private":false,"permissions":{"push":true,"admin":true}},
+ {"full_name":"tester/beta","private":true,"permissions":{"push":true,"admin":true}},
+ {"full_name":"tester/secrets","private":true,"permissions":{"push":true,"admin":true}}]'
 PAGE2='[
- {"full_name":"tester/hidden","private":true,"permissions":{"push":true}}]'
-# Everything present, but one of them is read-only.
-READONLY_ONE='[
- {"full_name":"tester/alpha","private":false,"permissions":{"push":true}},
- {"full_name":"tester/beta","private":true,"permissions":{"push":false}}]'
+ {"full_name":"tester/hidden","private":true,"permissions":{"push":true,"admin":true}}]'
 
 echo "== the inverted scope check =="
 mkplay tester/alpha tester/beta
@@ -109,32 +125,68 @@ echo "$out" | grep -q "repos       2 checked out" \
   || bad "wrong repo count: $(echo "$out" | grep 'repos ')"
 
 mkgh "github_pat_x" "$DRIFTED"
+grant tester/alpha tester/beta tester/secrets
 out=$(run); rc=$?
 { [ $rc -ne 0 ] && echo "$out" | grep -q "not checked out in this box"; } \
   && ok "a token reaching a repo that is NOT in the box: REFUSED" \
   || bad "drifted token accepted (rc=$rc): $out"
 echo "$out" | grep -q "tester/secrets" \
   && ok "names the offending repository" || bad "did not name the extra repo"
+# Drift has two remedies and the message used to name one, which made the box
+# look like it wanted the token narrowed BEFORE you could clone — a
+# chicken-and-egg that does not exist, because cloning happens on the host.
+echo "$out" | grep -q "gh repo clone" \
+  && ok "offers the bring-it-in remedy too, not just 'narrow the token'" \
+  || bad "only offered one way out of drift"
+echo "$out" | grep -q "on the HOST" \
+  && ok "says where to run it, since the playground is bind-mounted" \
+  || bad "did not say the clone happens on the host"
 echo "$out" | grep -q "devbox ready" && bad "still printed 'devbox ready'" || ok "did not print 'devbox ready'"
 
 # Without --paginate this token looks perfectly scoped: the extra repo is on
 # page two.
 mkgh "github_pat_x" "$SCOPED" "$PAGE2"
+grant tester/alpha tester/beta tester/hidden
 out=$(run); rc=$?
 { [ $rc -ne 0 ] && echo "$out" | grep -q "tester/hidden"; } \
   && ok "an extra repo on PAGE TWO is still caught (--paginate)" \
   || bad "page-two repo missed (rc=$rc): $out"
 
-echo "== capability, which is NOT fatal here =="
-# Cloning something you can only read is normal in a multi-repo box, so this
-# warns rather than stopping — but it must not be silent, or you find out an
-# hour later at `git push`.
-mkgh "github_pat_x" "$READONLY_ONE"
+echo "== a listing is not a grant =="
+# The check this replaced read `.permissions.push` out of the user/repos listing
+# and called it the token's scope. It is not. GitHub reports your ROLE there, so
+# a PAT limited to two repositories and a PAT granted every one return identical
+# JSON — the old check was counting repositories you OWN. Every private repo you
+# had not yet cloned into the box read as drift, and no token could start the
+# box until the playground held your entire account.
+mkplay tester/alpha tester/beta
+mkgh "github_pat_x" "$DRIFTED"   # tester/secrets is LISTED, and (no `grant`
+                                 # call) is NOT reachable by this token
 out=$(run); rc=$?
-{ [ $rc -eq 0 ] && echo "$out" | grep -q "cannot push to these repositories"; } \
-  && ok "a repo the token cannot push to: warns, still starts" \
-  || bad "no-push handling wrong (rc=$rc): $out"
-echo "$out" | grep -q "tester/beta" && ok "names the unpushable repo" || bad "did not name it"
+{ [ $rc -eq 0 ] && echo "$out" | grep -q "devbox ready"; } \
+  && ok "a private repo you own that the token CANNOT reach is not drift" \
+  || bad "owning a repo counted as reaching it (rc=$rc): $out"
+echo "$out" | grep -q "tester/secrets" \
+  && bad "named a repo the token cannot reach" \
+  || ok "does not name a repo it cannot reach"
+
+# The other half of the same point. Public repos are never counted, inside the
+# box or out: every fine-grained token reads them regardless, and proving WRITE
+# access would mean attempting a write. So the number reported is a floor, and
+# it says so rather than implying a total it cannot measure.
+mkplay tester/alpha tester/beta
+mkgh "github_pat_x" '[
+ {"full_name":"tester/alpha","private":false,"permissions":{"push":true,"admin":true}},
+ {"full_name":"tester/beta","private":true,"permissions":{"push":true,"admin":true}},
+ {"full_name":"tester/blog","private":false,"permissions":{"push":true,"admin":true}}]'
+grant tester/alpha tester/beta tester/blog
+out=$(run); rc=$?
+{ [ $rc -eq 0 ] && echo "$out" | grep -q "devbox ready"; } \
+  && ok "a PUBLIC repo outside the box does not stop the box" \
+  || bad "public repo treated as drift (rc=$rc): $out"
+echo "$out" | grep -q "reaches >=2 repos" \
+  && ok "reports the reach as a floor, not a total" \
+  || bad "wrong scope line: $(echo "$out" | grep 'scope ')"
 
 echo "== the empty-playground exception =="
 # Nothing is checked out yet, so every repo the token reaches would look extra.
@@ -428,8 +480,9 @@ for n in target vendor node_modules .venv; do
   git init -q "$PLAY/$n"
   git -C "$PLAY/$n" remote add origin "https://github.com/tester/$n.git"
   mkgh "github_pat_x" '[
-   {"full_name":"tester/'"$n"'","private":false,"permissions":{"push":true}},
-   {"full_name":"tester/secrets","private":true,"permissions":{"push":true}}]'
+   {"full_name":"tester/'"$n"'","private":false,"permissions":{"push":true,"admin":true}},
+   {"full_name":"tester/secrets","private":true,"permissions":{"push":true,"admin":true}}]'
+  grant "tester/$n" tester/secrets
   out=$(run); rc=$?
   { [ $rc -ne 0 ] && echo "$out" | grep -q "not checked out in this box"; } \
     && ok "a repo named '$n' is scanned, and drift is still caught" \
@@ -622,6 +675,7 @@ rm -rf "$HOME/.docker"
 
 echo "== --audit checks token scope too =="
 mkgh "github_pat_x" "$DRIFTED"
+grant tester/alpha tester/beta tester/secrets
 out=$( export PATH="/tmp/fakebin:$PATH" DEVBOX_PLAYGROUND="$PLAY"; cd "$PLAY" && bash "$SETUP" --audit 2>&1 ); rc=$?
 { [ $rc -ne 0 ] && echo "$out" | grep -q "not checked out in this box"; } \
   && ok "audit catches a drifted token (not just guards)" \

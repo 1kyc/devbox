@@ -77,7 +77,6 @@ against the repositories checked out in the playground:
 | More than one credential reachable (second account, GH_TOKEN over a stored token, an enterprise token) | **hard stop** — only the selected one can be checked |
 | A credential devbox cannot verify (enterprise host) | **hard stop** — github.com credentials only |
 | Scope cannot be verified (API error, offline, unparseable answer) | **hard stop** |
-| A repo in the box the token cannot push to | warning, box starts |
 | Playground empty (fresh box) | reported, box starts |
 | No token stored at all | box starts unauthenticated, prints instructions |
 
@@ -85,6 +84,20 @@ That comparison runs in the direction that matters. The predictable way this
 setup rots is that you clone something new, hit a 403, widen the token, and
 repeat until it covers your whole account — checking against what is actually
 checked out turns that drift into a startup failure instead of a slow leak.
+
+**"Reaches" is measured, not read.** No GitHub endpoint reports what a
+fine-grained token was granted (`GET /user/repos` reports what you *own*, which
+is a different question), so the box finds out by asking for each private repo
+you own that is not checked out here: granted repos come back, the rest 404.
+Public repositories are never counted — every fine-grained token can read them
+whatever you selected. That makes the reported count a floor, which is why it
+prints as `reaches >=N`. See DESIGN.md, "A listing is not a grant".
+
+**Clone from the host, not from inside the box.** The playground is bind-mounted
+from your machine, so `cd ~/dev && gh repo clone owner/name` in WSL uses your
+normal credentials and the box simply sees the result. There is no ordering
+problem to solve — a repo does not need to be in the token before you can put it
+in the playground. Add it to the token when you want the box to push it.
 
 Note the last two rows: the check keys off whether a token is **stored**, not
 whether `gh auth status` succeeds. A network failure leaves the token on disk
@@ -190,7 +203,8 @@ bash tests/launcher.sh
 ```
 
 178 assertions: the box's invariants, the scope check's refusals (with a fake
-`gh`), and the worktree round-trip.
+`gh` whose listing and whose grant are set separately, because on GitHub they
+are different things), and the worktree round-trip.
 
 ## Troubleshooting
 

@@ -66,22 +66,52 @@ ever alerted you, because every individual step was reasonable.
 So the check compares the token's reach against what is actually checked out,
 and a repo in the token but not in the playground is a startup failure.
 
-Three details that are easy to get wrong:
+### A listing is not a grant
 
-- **Public read is not counted.** A fine-grained token "always include[s]
-  read-only access to all public repositories on GitHub" (GitHub's words), so
-  counting repositories rejects a perfectly scoped token. The set that matters
-  is `private == true or permissions.push == true`. Open egress means every
-  public repo is reachable regardless of the token, so this is not a loss.
+The obvious implementation is wrong, and this box shipped it for six commits.
+`GET /user/repos` returns a `permissions` object per repository, which reads
+exactly like the token's rights and is not: it is **your role on the repo**. For
+anything you own it is `{"push": true, "admin": true}` however narrow the token
+— a PAT granted three repositories and a PAT granted all of them return
+byte-identical JSON.
+
+So the first version measured how many repositories the account *owned*. Every
+private repo not yet cloned into the playground read as drift, and the box
+refused to start until the playground held the entire account. The endpoint
+answers "what do you own". It never answers "what may this token touch".
+
+Nor does anything else. `installation/repositories` would, but it refuses a PAT
+outright (403). A fine-grained token's repository grant is not readable, so it
+has to be **observed**: for every private repo you own that is not checked out
+here, fetch it. Inside the grant that returns the repo; outside it, a 404. That
+probe is the whole check.
+
+Which fixes the coverage this can and cannot have:
+
+- **Private repos are decidable.** Reachable or 404, no ambiguity, one request
+  each.
+- **Public repos are not, and are never counted.** A fine-grained token "always
+  include[s] read-only access to all public repositories on GitHub" (GitHub's
+  words), so counting reads rejects a perfectly scoped token — and with open
+  egress every public repo is reachable regardless of the token, so nothing is
+  lost by ignoring them. Counting *writes* would mean attempting a write to find
+  out. This box does not write to repositories in order to audit them.
+
+That is why the summary reads `reaches >=N repos`. It is a floor, and it is
+labelled as one rather than printed as a total the box cannot measure.
+
+There is deliberately **no** "can it push where you work?" check any more. It
+read the same `.permissions.push` field, so for the repositories this box holds
+— ones you own — it was true unconditionally and could never fire. A check that
+cannot fail is worse than no check: it implies coverage that does not exist.
+
+Two smaller details that are still easy to get wrong:
+
 - **`--paginate`.** `per_page` caps at 100. Without it, a token whose extra
   repositories sort onto page two looks perfectly scoped.
 - **An unparseable answer is not an empty one.** A `jq` failure must land in
   "unverifiable" (a stop), not look like a narrow token. `pipefail` makes the
   assignment fail so it takes the right branch.
-
-The mirror question — *can* it push where you work — is a **warning** here, not a
-stop. In a one-repo box a token that cannot push means a broken box. In a
-multi-repo box, cloning something you can only read is normal.
 
 **The empty-playground exception:** on a fresh box nothing is checked out, so
 every repo the token reaches looks extra. Failing there would make the box
