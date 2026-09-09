@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# devbox: make `codex update` work with this box's install layout.
+#
+# The box deliberately splits Codex in two:
+#
+#   ~/.local/share/codex   the program        (image, $CODEX_STANDALONE_HOME)
+#   ~/.codex               login and sessions (volume, $CODEX_HOME)
+#
+# That split is what keeps ~320 MB out of every persistent volume and stops a
+# stale volume shadowing the image after a rebuild (see DESIGN.md). But Codex
+# looks for its own installation under $CODEX_HOME, so a plain `codex update`
+# inside the box reports:
+#
+#   Error: Could not detect the Codex installation method.
+#
+# Codex's updater shells out to the official install script and that script
+# sites its work off $CODEX_HOME, so pointing CODEX_HOME at the program
+# directory for the duration of `update` is enough: detection succeeds and the
+# new version lands where the old one lives. Nothing else sees the override, so
+# login and sessions stay where they belong — which is why this is a per-command
+# wrapper and not a global CODEX_HOME change.
+#
+# Lives in /usr/local/share/devbox/bin/, root-owned, ahead of ~/.local/bin on
+# PATH, exactly like the gh shim.
+set -uo pipefail
+
+self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+
+# Find the first real codex on PATH that is not this wrapper.
+real=""
+IFS=':' read -r -a _dirs <<< "$PATH"
+for d in "${_dirs[@]}"; do
+  [ -n "$d" ] || continue
+  cand="$d/codex"
+  [ -x "$cand" ] || continue
+  [ "$(readlink -f "$cand" 2>/dev/null || echo "$cand")" = "$self" ] && continue
+  real="$cand"
+  break
+done
+
+if [ -z "$real" ]; then
+  echo "devbox: the real codex CLI was not found on PATH." >&2
+  exit 127
+fi
+
+# Only the `update` subcommand, and only as the FIRST argument — so a prompt
+# that happens to contain the word "update" is passed through untouched.
+if [ "${1:-}" = "update" ]; then
+  exec env CODEX_HOME="${CODEX_STANDALONE_HOME:-$HOME/.local/share/codex}" "$real" "$@"
+fi
+
+exec "$real" "$@"

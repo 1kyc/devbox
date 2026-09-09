@@ -147,6 +147,51 @@ echo "$out" | grep -q "merging is disabled" \
 [ "$(bash -lc 'command -v gh')" = /usr/local/share/devbox/bin/gh ] \
   && ok "the shim is not bypassable via a login shell" || bad "login shell bypasses the shim"
 
+echo "== codex update works with the split install layout =="
+# Codex looks for its installation under $CODEX_HOME, which here holds only
+# login and sessions — the program lives on the image. A plain `codex update`
+# therefore failed with "Could not detect the Codex installation method". The
+# wrapper points CODEX_HOME at the program directory for that one subcommand.
+#
+# Tested against a fake codex placed AFTER the guard dir on PATH, so the
+# wrapper runs, finds the fake as the "real" binary, and we can see exactly
+# what environment and arguments it forwards — no network, no real update.
+mkdir -p /tmp/fakecodex
+cat > /tmp/fakecodex/codex <<'EOF'
+#!/usr/bin/env bash
+echo "CODEX_HOME=$CODEX_HOME"
+echo "ARGS=$*"
+EOF
+chmod +x /tmp/fakecodex/codex
+probe() { PATH="/usr/local/share/devbox/bin:/tmp/fakecodex:$PATH" codex "$@"; }
+
+[ "$(command -v codex)" = /usr/local/share/devbox/bin/codex ] \
+  && ok "codex resolves to the wrapper" || bad "codex -> $(command -v codex)"
+
+out="$(probe update)"
+echo "$out" | grep -qx "CODEX_HOME=$CODEX_STANDALONE_HOME" \
+  && ok "'codex update' runs against the program directory" \
+  || bad "update got the wrong CODEX_HOME: $out"
+echo "$out" | grep -qx "ARGS=update" \
+  && ok "and the subcommand is forwarded unchanged" || bad "args mangled: $out"
+
+out="$(probe exec 'please update the readme')"
+echo "$out" | grep -qx "CODEX_HOME=$CODEX_HOME" \
+  && ok "every other command keeps the normal CODEX_HOME (login stays put)" \
+  || bad "non-update command had CODEX_HOME rewritten: $out"
+echo "$out" | grep -q "ARGS=exec please update the readme" \
+  && ok "a prompt containing the word 'update' is not mistaken for the subcommand" \
+  || bad "prompt mangled: $out"
+
+out="$(probe --version)"
+echo "$out" | grep -qx "CODEX_HOME=$CODEX_HOME" \
+  && ok "flags forward without the override" || bad "--version got the override: $out"
+rm -rf /tmp/fakecodex
+
+# The real thing must still work end to end.
+codex --version >/dev/null 2>&1 && ok "the real codex still runs through the wrapper" \
+  || bad "codex --version broke"
+
 echo "== setup.sh =="
 cd "$PLAYGROUND"
 out=$(/usr/local/share/devbox/setup.sh 2>&1); rc=$?
