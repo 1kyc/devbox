@@ -72,9 +72,10 @@ RUN mkdir -p "/home/$USERNAME/.claude" "/home/$USERNAME/.codex" \
 # installer below sites its work off $HOME.
 ENV HOME=/home/$USERNAME
 ENV FNM_DIR=/home/$USERNAME/.local/share/fnm
-# Defined ONCE and used twice below. Spelling this list out in both places is
-# how the login-shell restore silently drifts from the image PATH — and a drift
-# that drops the guard dir is exactly the failure the restore exists to prevent.
+# Defined ONCE and used three times below. Spelling this list out separately in
+# each place is how the login-shell restores silently drift from the image PATH —
+# and a drift that drops the guard dir is exactly the failure they exist to
+# prevent.
 ENV DEVBOX_PATH=/usr/local/share/devbox/bin:/home/$USERNAME/.local/bin:$FNM_DIR/aliases/default/bin
 ENV PATH=$DEVBOX_PATH:$PATH
 
@@ -163,6 +164,46 @@ RUN curl -fsSL https://fnm.vercel.app/install -o /tmp/install-fnm.sh \
  && "$HOME/.local/bin/fnm" install "$NODE_VERSION" \
  && "$HOME/.local/bin/fnm" alias "$NODE_VERSION" default \
  && "$FNM_DIR/aliases/default/bin/corepack" enable --install-directory "$HOME/.local/bin"
+
+# --- login-shell PATH, the last word -----------------------------------------
+#
+# /etc/profile.d/10-devbox-path.sh restores PATH after /etc/profile wipes it,
+# but it is not the last thing a login shell reads. Debian's stock ~/.profile
+# runs after it and ends with:
+#
+#     if [ -d "$HOME/.local/bin" ] ; then PATH="$HOME/.local/bin:$PATH" ; fi
+#
+# which puts ~/.local/bin in FRONT of the guard dir. Everything installed above
+# lives there, so in a login shell — which is how the box is entered, and how
+# `devbox cc`/`cx` start an agent — a real binary shadows its wrapper.
+#
+# Not hypothetical: `codex update` reached the real codex and died with "Could
+# not detect the Codex installation method" while its wrapper sat unreachable
+# two entries further down. The test that should have caught it asserted
+# resolution in a NON-login shell, where the ENV PATH above still held, so it
+# passed for every build while the box was broken for every user.
+#
+# The gh shim survived only by accident of address: gh is in /usr/bin, which the
+# guard dir still outranks. But ~/.local/bin is writable by the agent, so while
+# it sat in front, `cp "$(command -v -a gh | tail -1)" ~/.local/bin/gh` was
+# enough to make the merge shim disappear. Ordering was doing load-bearing work
+# it had not actually been given.
+#
+# bash reads the FIRST of ~/.bash_profile, ~/.bash_login, ~/.profile, so this
+# file wins by existing. It sources ~/.profile rather than replacing it, then
+# re-applies DEVBOX_PATH: a new file instead of an edit to a stock one, and
+# immune to whatever a later installer appends to ~/.profile.
+RUN printf '%s\n' \
+      '# devbox: bash reads THIS instead of ~/.profile, so source that first.' \
+      '[ -f "$HOME/.profile" ] && . "$HOME/.profile"' \
+      '' \
+      '# ...then have the last word on PATH. ~/.profile ends by prepending' \
+      '# ~/.local/bin, which would otherwise shadow the guard dir and with it' \
+      '# every wrapper this box relies on.' \
+      "PATH=\"$DEVBOX_PATH:\$PATH\"" \
+      'export PATH' \
+      > "$HOME/.bash_profile" \
+ && chmod 0644 "$HOME/.bash_profile"
 
 # --- guards ------------------------------------------------------------------
 #

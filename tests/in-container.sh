@@ -41,6 +41,34 @@ echo "== login shells keep the guard dir on PATH =="
   && ok "bash -l resolves gh to the shim" || bad "bash -l gh -> $(bash -lc 'command -v gh')"
 bash -lc 'command -v node >/dev/null' && ok "bash -l has node" || bad "bash -l lost node"
 bash -lc 'command -v claude >/dev/null' && ok "bash -l has claude" || bad "bash -l lost claude"
+# Ordering, not just membership. The guard dir has to outrank ~/.local/bin and
+# not merely /usr/bin: ~/.local/bin holds codex, claude, uv, fnm and python, and
+# is writable by the agent. Debian's ~/.profile prepends it AFTER
+# /etc/profile.d runs, so ~/.bash_profile is what settles this.
+bash -lc 'echo "$PATH"' | tr : '\n' \
+  | awk -v g=/usr/local/share/devbox/bin -v l="$HOME/.local/bin" '
+      $0==g && !gi {gi=NR} $0==l && !li {li=NR}
+      END { exit !(gi && li && gi < li) }' \
+  && ok "bash -l puts the guard dir ahead of ~/.local/bin" \
+  || bad "login PATH puts ~/.local/bin first: $(bash -lc 'echo $PATH')"
+# The concrete consequence: a binary the agent plants in ~/.local/bin must not
+# displace a guard of the same name.
+#
+# `type -aP`, not `command -v -a` — the latter is not valid bash (command takes
+# only -pVv), so it printed a usage error, cp copied nothing, and the assertion
+# passed unconditionally. Exactly the failure this whole section exists to catch,
+# committed inside the test for it. The source path is asserted before use so a
+# silent no-op cannot come back.
+real_gh="$(type -aP gh | grep -v '^/usr/local/share/devbox/' | head -1)"
+if [ -x "$real_gh" ]; then
+  cp "$real_gh" "$HOME/.local/bin/gh"
+  [ "$(bash -lc 'command -v gh')" = /usr/local/share/devbox/bin/gh ] \
+    && ok "a gh planted in ~/.local/bin does not shed the shim" \
+    || bad "shim shed by a file in ~/.local/bin"
+  rm -f "$HOME/.local/bin/gh"
+else
+  bad "could not locate the real gh to plant (got '$real_gh')"
+fi
 
 echo "== programs live on the image, not in a volume =="
 # A volume mounted over an image directory HIDES the image's copy: anything
@@ -165,8 +193,15 @@ EOF
 chmod +x /tmp/fakecodex/codex
 probe() { PATH="/usr/local/share/devbox/bin:/tmp/fakecodex:$PATH" codex "$@"; }
 
-[ "$(command -v codex)" = /usr/local/share/devbox/bin/codex ] \
-  && ok "codex resolves to the wrapper" || bad "codex -> $(command -v codex)"
+# In a LOGIN shell, because that is how the box is actually entered: `devbox`,
+# `devbox cc`, `devbox cx` and the container's own boot command all use bash -l.
+# This assertion used to run in the suite's own non-login shell, where Docker's
+# ENV PATH still put the guard dir first — so it passed while `codex update` was
+# broken for everyone, shadowed by the real binary in ~/.local/bin.
+lv="$(bash -lc 'command -v codex')"
+[ "$lv" = /usr/local/share/devbox/bin/codex ] \
+  && ok "codex resolves to the wrapper in a LOGIN shell" \
+  || bad "login-shell codex -> $lv"
 
 out="$(probe update)"
 echo "$out" | grep -qx "CODEX_HOME=$CODEX_STANDALONE_HOME" \
