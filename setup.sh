@@ -788,6 +788,32 @@ must mkdir -p "$CLAUDE_DIR" "$CODEX_DIR"
 CLAUDE_STAMP="$CLAUDE_DIR/.devbox-seeded"
 CODEX_STAMP="$CODEX_DIR/.devbox-seeded"
 
+# Codex assumes its program and its state share one root: it looks for the
+# managed install at $CODEX_HOME/packages/standalone/current. This box splits
+# them on purpose — program on the image, state in the volume (DESIGN.md) — so
+# that path does not exist, and `codex remote-control start` refuses outright:
+#
+#   Error: managed standalone Codex install not found at
+#   /home/kyc/.codex/packages/standalone/current/codex
+#
+# A symlink satisfies it: remote-control stats and execs that path, and
+# following the link lands on the image copy. Recreated every boot rather than
+# once, so a fresh volume or a rebuild that moves the program cannot leave it
+# dangling.
+#
+# This does NOT make `codex update` work. That resolves the RUNNING binary's
+# real path and compares it against CODEX_HOME, and realpath goes straight
+# through the link — which is what guards/bin/codex exists for. Two mechanisms,
+# one root cause; see DESIGN.md for why the split is still worth its cost.
+#
+# Skipped when packages/ is a real directory: that is the "program moved into
+# the volume" case, which check_guards() already reports, and clobbering it here
+# would hide it.
+CODEX_PACKAGES="${CODEX_STANDALONE_HOME:-$HOME/.local/share/codex}/packages"
+if [ ! -e "$CODEX_DIR/packages" ] || [ -L "$CODEX_DIR/packages" ]; then
+  ln -sfn "$CODEX_PACKAGES" "$CODEX_DIR/packages"
+fi
+
 seed_claude() {
   local f="$CLAUDE_DIR/settings.json"
   if [ ! -s "$f" ]; then

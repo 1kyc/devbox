@@ -74,8 +74,13 @@ echo "== programs live on the image, not in a volume =="
 # A volume mounted over an image directory HIDES the image's copy: anything
 # installed under one is copied into the volume once and then never tracks the
 # image again, so a rebuild silently keeps serving the old program.
-[ ! -e "$HOME/.codex/packages" ] \
-  && ok "the codex package is not under the ~/.codex mount point" \
+# A real directory here means the program itself was installed into the volume,
+# which is the failure above. A SYMLINK is different and is now required: codex
+# remote-control refuses to start without $CODEX_HOME/packages/standalone, and
+# setup.sh points that at the image copy. The distinction is the whole check —
+# "does not exist" was the old invariant and would reject the link.
+{ [ ! -e "$HOME/.codex/packages" ] || [ -L "$HOME/.codex/packages" ]; } \
+  && ok "no real package dir under the ~/.codex mount point" \
   || bad "codex installed into its volume ($(du -sh $HOME/.codex | cut -f1))"
 readlink "$HOME/.local/bin/codex" | grep -q '^/home/[^/]*/\.local/share/codex/' \
   && ok "codex symlink points at the image" \
@@ -226,6 +231,21 @@ rm -rf /tmp/fakecodex
 # The real thing must still work end to end.
 codex --version >/dev/null 2>&1 && ok "the real codex still runs through the wrapper" \
   || bad "codex --version broke"
+
+# Codex looks for its managed install at $CODEX_HOME/packages/standalone/current
+# and refuses to start remote-control without it. setup.sh links that path at
+# the image copy; without the link the feature is simply unavailable in the box.
+[ -L "$CODEX_HOME/packages" ] \
+  && ok "CODEX_HOME/packages is a link, not 320 MB in the volume" \
+  || bad "CODEX_HOME/packages is not a symlink"
+[ -x "$CODEX_HOME/packages/standalone/current/codex" ] \
+  && ok "the managed-install path remote-control requires resolves and is executable" \
+  || bad "$CODEX_HOME/packages/standalone/current/codex is not executable"
+real_target="$(readlink -f "$CODEX_HOME/packages")"
+case "$real_target" in
+  "$CODEX_STANDALONE_HOME"/*) ok "and it resolves onto the image copy, not the volume" ;;
+  *) bad "packages link resolves to $real_target" ;;
+esac
 
 echo "== setup.sh =="
 cd "$PLAYGROUND"

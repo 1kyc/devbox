@@ -294,6 +294,47 @@ point `CODEX_HOME` at an image path *for the install only*, with a Dockerfile
 assertion that the mount point stayed empty and a runtime check that the symlink
 still points at the image.
 
+### What the Codex split costs, and why it is still worth it
+
+Codex assumes program and state share one root. Splitting them is the one place
+this box works against a vendor's design, so it is worth being explicit about
+the bill.
+
+Leaving it alone would mean the program lives in the volume, and then:
+
+- the volume carries the program — **644 MB** at the time of writing, because
+  the installer keeps old releases alongside new ones, and a volume only grows;
+- worse, **the volume shadows the image**, so `CODEX_VERSION` stops meaning
+  anything. A rebuild could never update or repair Codex. The only way to
+  replace a broken one would be deleting the volume, which also deletes your
+  login, your config and every session in it.
+
+That second point is the real argument. The version you can rebuild to is the
+thing you fall back on when an update breaks something.
+
+What it costs: two Codex features look for the managed install under
+`$CODEX_HOME`, and both need a patch.
+
+| Feature | Why it breaks | Patch |
+|---|---|---|
+| `codex update` | resolves the **running binary's real path** and compares it to `CODEX_HOME` | `guards/bin/codex` runs that one subcommand with `CODEX_HOME` pointed at the program dir |
+| `codex remote-control start` | **stats** `$CODEX_HOME/packages/standalone/current/codex` | `setup.sh` links `~/.codex/packages` at the image copy |
+
+They need separate patches because they ask different questions. A symlink
+satisfies a `stat`; it does not satisfy a `realpath` comparison, which follows
+straight through it. Confirmed by testing: with the link in place, the real
+`codex update` still reports "Could not detect the Codex installation method".
+
+One consequence worth knowing: `codex update` writes to the container's
+writable layer, so **an update does not survive `--force-recreate`** — the box
+returns to the image's `CODEX_VERSION`. That is the design working as intended
+rather than a bug, but it does mean the durable way to move versions is the
+build arg, and `codex update` is a patch until the next rebuild.
+
+If a third feature turns up needing that layout, the calculus changes: three
+patches is the point to stop fighting it and move the program into the volume,
+accepting a pinned version you can no longer rebuild your way out of.
+
 | On the image | In a volume |
 |---|---|
 | `~/.local` — claude, codex, uv, fnm, python, node | `~/.claude`, `~/.codex` — config, logins, sessions |
