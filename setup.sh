@@ -248,8 +248,15 @@ check_guards() {
   # update run without CODEX_HOME pointed at the image copy moves ~320 MB into
   # the volume and repoints the binary there, which quietly undoes the install
   # layout and makes CODEX_VERSION stop meaning anything.
+  # readlink -f, not readlink: since setup.sh links CODEX_HOME/packages at the
+  # image copy, a binary symlink can legitimately ROUTE through
+  # ~/.codex/packages/standalone/current and still land on the image — which is
+  # exactly what the remote-control daemon does when it self-updates. Matching
+  # the first hop reported that as "codex now runs out of its persistent
+  # volume" while 644 MB sat on the image where it belonged. What the guard
+  # actually cares about is where the chain ENDS.
   local codex_link
-  codex_link="$(readlink "$HOME/.local/bin/codex" 2>/dev/null || true)"
+  codex_link="$(readlink -f "$HOME/.local/bin/codex" 2>/dev/null || true)"
   case "$codex_link" in
     "${CODEX_HOME:-$HOME/.codex}"/*)
       warn ""

@@ -82,9 +82,12 @@ echo "== programs live on the image, not in a volume =="
 { [ ! -e "$HOME/.codex/packages" ] || [ -L "$HOME/.codex/packages" ]; } \
   && ok "no real package dir under the ~/.codex mount point" \
   || bad "codex installed into its volume ($(du -sh $HOME/.codex | cut -f1))"
-readlink "$HOME/.local/bin/codex" | grep -q '^/home/[^/]*/\.local/share/codex/' \
-  && ok "codex symlink points at the image" \
-  || bad "codex symlink -> $(readlink $HOME/.local/bin/codex)"
+# Where the chain ENDS. The link may legitimately route through
+# ~/.codex/packages (setup.sh puts that there for remote-control) and still
+# resolve onto the image; only the final target decides.
+readlink -f "$HOME/.local/bin/codex" | grep -q '^/home/[^/]*/\.local/share/codex/' \
+  && ok "codex resolves onto the image, however it routes" \
+  || bad "codex resolves to $(readlink -f $HOME/.local/bin/codex)"
 for d in .claude .codex .config/gh .cache/uv .npm; do
   awk -v p="$HOME/$d" '$2 == p {f=1} END {exit !f}' /proc/mounts \
     && ok "~/$d is a volume (persists)" || bad "~/$d is NOT a volume"
